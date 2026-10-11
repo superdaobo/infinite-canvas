@@ -139,6 +139,13 @@ func New() *gin.Engine {
 	v1.POST("/collab/invites/accept", gin.WrapF(handler.CollabAcceptInvite))
 	v1.POST("/collab/rooms/:id/operations", func(c *gin.Context) { handler.CollabApplyOperations(c.Writer, c.Request, c.Param("id")) })
 	v1.GET("/collab/rooms/:id/graph", func(c *gin.Context) { handler.CollabRoomGraph(c.Writer, c.Request, c.Param("id")) })
+	v1.POST("/collab/rooms/:id/ws-ticket", func(c *gin.Context) {
+		handler.CollabCreateWSTicket(c.Writer, c.Request, c.Param("id"))
+	})
+	// WS 升级端点不挂 UserAuth：身份由首帧 hello 的 ticket 绑定，JWT 不入 URL。
+	api.GET("/v1/collab/rooms/:id/ws", func(c *gin.Context) {
+		handler.CollabWS(c.Writer, c.Request, c.Param("id"))
+	})
 	api.GET("/proxy-image", gin.WrapF(handler.ProxyImage))
 	api.GET("/prompts", middleware.OptionalAuth, gin.WrapF(handler.Prompts))
 	api.GET("/agent-skills", gin.WrapF(handler.AgentSkills))

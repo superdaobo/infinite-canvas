@@ -38,7 +38,13 @@ func ApplyRoomOperations(ctx context.Context, roomID string, envelope contract.E
 	if err != nil {
 		return model.RoomBatchResult{}, err
 	}
-	return repository.ApplyRoomBatch(roomID, user.ID, envelope.OperationID, digest, envelope.Operations)
+	result, err := repository.ApplyRoomBatch(roomID, user.ID, envelope.OperationID, digest, envelope.Operations)
+	if err != nil {
+		return model.RoomBatchResult{}, err
+	}
+	// 确认与广播只在事务提交后发生；幂等重放不重复广播。
+	broadcastRoomChanges(roomID, result)
+	return result, nil
 }
 
 // ReadRoomGraph 返回当前用户可访问房间的公共图快照。

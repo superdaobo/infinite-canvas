@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tigerowo/infinite-canvas/internal/collab/realtime"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/repository"
 )
@@ -119,5 +120,10 @@ func DeleteCurrentUserRoom(ctx context.Context, roomID string) error {
 	if member.Role != model.RoomRoleOwner {
 		return ErrRoomForbidden
 	}
-	return repository.DeleteRoomCascade(roomID)
+	if err := repository.DeleteRoomCascade(roomID); err != nil {
+		return err
+	}
+	// 房间删除后关闭全部在线连接，避免继续向已删除房间推送。
+	realtime.Default.DisconnectRoom(roomID, "房间已删除")
+	return nil
 }

@@ -4,10 +4,11 @@ go 1.25.0
 
 require (
 	github.com/caarlos0/env/v11 v11.3.1
+	github.com/coder/websocket v1.8.15
 	github.com/gin-gonic/gin v1.11.0
 	github.com/glebarez/sqlite v1.11.0
-	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/go-sql-driver/mysql v1.8.1
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/robfig/cron/v3 v3.0.1
