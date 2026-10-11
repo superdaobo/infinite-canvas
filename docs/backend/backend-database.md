@@ -39,6 +39,9 @@ description: 当前后端主要数据表与字段说明
 - `collab_rooms`
 - `collab_room_members`
 - `collab_room_invites`
+- `collab_room_nodes`
+- `collab_room_edges`
+- `collab_room_operations`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -421,6 +424,56 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 索引：`idx_collab_room_invites_room (room_id)`、`token_hash` 唯一索引
 
 删除房间时在同一事务内级联删除该房间的邀请记录。
+
+### collab_room_nodes
+
+协作房间公共图节点表（协作 v1）。`room_id + id` 组成主键；`metadata` 只存进入公共图的 JSON 字段，`deleted` 为软删除墓碑（用于区分“已删除”与“从未存在”）。`version` 是节点版本，供 `expectedNodeVersion` 冲突检测使用。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `id` 组成主键 |
+| `id` | string | 节点 ID |
+| `kind` | string | 节点种类：`image`/`panorama`/`video`/`audio`/`text`/`group`/`config`/`director` |
+| `title` | string | 标题，最长 512 rune |
+| `position_x` / `position_y` | number | 世界坐标 |
+| `width` / `height` | number | 正有限宽高 |
+| `version` | number | 节点版本，创建后从 1 起，每次成功修改 +1 |
+| `metadata` | text | 公共 metadata 的 JSON |
+| `deleted` | bool | 软删除标记 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_nodes_room_deleted (room_id, deleted)`
+
+### collab_room_edges
+
+协作房间公共图连线表（协作 v1）。`room_id + id` 组成主键，表示 `from_node_id -> to_node_id` 的有向边；端点必须属于同一房间且未删除。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `id` 组成主键 |
+| `id` | string | 连线 ID |
+| `from_node_id` / `to_node_id` | string | 有向端点节点 ID |
+| `version` | number | 连线版本，新建为 1，更新 +1 |
+| `deleted` | bool | 软删除标记 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_edges_room_deleted (room_id, deleted)`
+
+### collab_room_operations
+
+协作房间操作幂等回执表（协作 v1）。`room_id + user_id + operation_id` 组成主键；`request_digest` 是请求体摘要，`response_json` 是已存结果。相同幂等键 + 相同摘要直接返回既有结果，摘要不同返回 `operation_id_reused`。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `user_id`、`operation_id` 组成主键 |
+| `user_id` | string | 提交用户 ID |
+| `operation_id` | string | 幂等键 |
+| `request_digest` | string | 请求体 SHA-256 摘要 |
+| `revision` | number | 该次提交后的房间 revision |
+| `response_json` | text | 已存结果 JSON |
+| `created_at` | datetime | 时间戳 |
+
+节点/连线/回执在同一事务内写入，房间 `revision` 恰好 +1；任一操作失败整批回滚。
 
 
 ### settings
