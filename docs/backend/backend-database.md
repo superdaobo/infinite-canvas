@@ -36,6 +36,8 @@ description: 当前后端主要数据表与字段说明
 - `canvas_projects`
 - `user_configs`
 - `storage_objects`
+- `collab_rooms`
+- `collab_room_members`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -365,6 +367,38 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 | `deleted_at` | string | 软删除时间，空字符串表示未删除；超过 7 天由启动时和每天定时任务物理清理 |
 
 索引：`idx_canvas_projects_user_deleted_updated (user_id, deleted_at, updated_at)`、`idx_canvas_projects_deleted_at (deleted_at)`
+
+
+### collab_rooms
+
+协作共享房间表（协作 v1）。每个房间一行，与个人画布 `canvas_projects` 完全独立；`revision` 用于后续操作批次的版本推进，本阶段仅做持久化基础。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 房间 ID，主键 |
+| `owner_id` | string | 房间创建者（owner）用户 ID |
+| `title` | string | 房间标题，最长 512 rune |
+| `revision` | number | 房间图版本号，初始为 0，提交成功后递增 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_collab_rooms_owner_updated (owner_id, updated_at)`
+
+### collab_room_members
+
+协作房间成员关系表（协作 v1）。一条记录表示某用户对某房间的访问权与角色，`room_id + user_id` 组成主键。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `user_id` 组成主键 |
+| `user_id` | string | 成员用户 ID |
+| `role` | string | 房间角色：`owner`、`editor`、`viewer` |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_collab_room_members_user (user_id)`
+
+删除房间时在同一事务内级联删除该房间的成员关系；该操作只作用于协作房间表，不改动个人画布。
 
 
 ### settings

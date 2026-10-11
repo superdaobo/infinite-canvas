@@ -84,6 +84,8 @@ func DB() (*gorm.DB, error) {
 			&model.CanvasProject{},
 			&model.ComfyBridge{},
 			&model.ComfyBridgeRequest{},
+			&model.Room{},
+			&model.RoomMember{},
 		)
 	})
 	return db, dbErr
