@@ -23,10 +23,10 @@ func New() *gin.Engine {
 	api.GET("/auth/me", middleware.OptionalAuth, gin.WrapF(handler.CurrentUser))
 	api.GET("/settings", gin.WrapF(handler.Settings))
 	api.GET("/storage/config", gin.WrapF(handler.StorageConfig))
-	api.GET("/files/:id", func(c *gin.Context) {
+	api.GET("/files/:id", middleware.OptionalAuth, func(c *gin.Context) {
 		handler.FileInfo(c.Writer, c.Request, c.Param("id"))
 	})
-	api.GET("/files/:id/content", func(c *gin.Context) {
+	api.GET("/files/:id/content", middleware.OptionalAuth, func(c *gin.Context) {
 		handler.FileContent(c.Writer, c.Request, c.Param("id"))
 	})
 	api.POST("/ai/direct-request", gin.WrapF(handler.PrepareDirectAIRequest))
@@ -141,6 +141,25 @@ func New() *gin.Engine {
 	v1.GET("/collab/rooms/:id/graph", func(c *gin.Context) { handler.CollabRoomGraph(c.Writer, c.Request, c.Param("id")) })
 	v1.POST("/collab/rooms/:id/ws-ticket", func(c *gin.Context) {
 		handler.CollabCreateWSTicket(c.Writer, c.Request, c.Param("id"))
+	})
+	// 房间级共享媒体：上传/播放/下载/删除均按房间成员鉴权（见 docs/collab-v1/security-boundaries.md）。
+	v1.POST("/collab/rooms/:id/media", func(c *gin.Context) {
+		handler.CollabUploadRoomMedia(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/collab/rooms/:id/media", func(c *gin.Context) {
+		handler.CollabRoomMediaList(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/collab/rooms/:id/media/:mediaId", func(c *gin.Context) {
+		handler.CollabRoomMediaMeta(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	v1.GET("/collab/rooms/:id/media/:mediaId/content", func(c *gin.Context) {
+		handler.CollabRoomMediaContent(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	v1.GET("/collab/rooms/:id/media/:mediaId/download", func(c *gin.Context) {
+		handler.CollabRoomMediaDownload(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	v1.DELETE("/collab/rooms/:id/media/:mediaId", func(c *gin.Context) {
+		handler.CollabDeleteRoomMedia(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
 	})
 	// WS 升级端点不挂 UserAuth：身份由首帧 hello 的 ticket 绑定，JWT 不入 URL。
 	api.GET("/v1/collab/rooms/:id/ws", func(c *gin.Context) {

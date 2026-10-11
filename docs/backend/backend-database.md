@@ -42,6 +42,7 @@ description: 当前后端主要数据表与字段说明
 - `collab_room_nodes`
 - `collab_room_edges`
 - `collab_room_operations`
+- `collab_room_media`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -474,6 +475,27 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 | `created_at` | datetime | 时间戳 |
 
 节点/连线/回执在同一事务内写入，房间 `revision` 恰好 +1；任一操作失败整批回滚。
+
+
+### collab_room_media
+
+协作房间共享媒体索引表（协作 v1，C04-01）。`room_id + id` 组成主键，`id` 为内容 SHA-256 摘要，因此同一房间重复上传相同内容会命中同一行（按摘要去重）。字节存放在服务端私有内容寻址目录（`MEDIA_DIR`，默认 `data/collab-media`），`storage_path` 相对该目录且绝不返回给客户端；房间媒体**不登记为公开的 `storage_objects`**，只能通过 `/api/v1/collab/rooms/:id/media/...` 的成员鉴权接口读取，不会被 `GET /api/files/:id` 匿名命中。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `id` 组成主键 |
+| `id` | string | 内容 SHA-256 十六进制摘要 |
+| `kind` | string | 媒体类别：`image`、`video`、`audio` |
+| `filename` | string | 原始文件名，最长 200 rune |
+| `mime_type` | string | 规范化后的 MIME 类型 |
+| `bytes` | number | 字节数 |
+| `storage_path` | string | 相对 `MEDIA_DIR` 的私有路径，绝不外泄 |
+| `created_by` | string | 上传者用户 ID |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_media_room_created (room_id, updated_at)`
+
+删除房间时在同一事务内级联删除该房间的媒体索引；blob 采用内容寻址，删除记录后若已无其他房间引用同一内容才回收文件。
 
 
 ### settings
