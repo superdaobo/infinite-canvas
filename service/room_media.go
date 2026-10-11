@@ -68,7 +68,18 @@ func UploadRoomMedia(ctx context.Context, roomID, filename, contentType string, 
 	if err != nil {
 		return model.RoomMediaView{}, err
 	}
+	return storeRoomMedia(roomID, member.UserID, filename, contentType, src)
+}
+
+// storeRoomMedia 是房间媒体的落地实现：内容按 SHA-256 摘要命名并去重，归属人由
+// 调用方给定。受信任的服务端路径（学校结果回填 #22）以任务提交人作为归属人调用，
+// 不经过用户 context；归属人必须是该房间的可写成员（由调用方先行校验）。
+func storeRoomMedia(roomID, actorID, filename, contentType string, src io.Reader) (model.RoomMediaView, error) {
 	roomID = strings.TrimSpace(roomID)
+	actorID = strings.TrimSpace(actorID)
+	if actorID == "" {
+		return model.RoomMediaView{}, ErrMediaInvalid
+	}
 	if src == nil {
 		return model.RoomMediaView{}, ErrMediaInvalid
 	}
@@ -138,7 +149,7 @@ func UploadRoomMedia(ctx context.Context, roomID, filename, contentType string, 
 	now := time.Now().UTC()
 	media := model.RoomMedia{
 		RoomID: roomID, ID: digest, Kind: kind, Filename: filename, MimeType: mimeType,
-		Bytes: size, StoragePath: relPath, CreatedBy: member.UserID, CreatedAt: now, UpdatedAt: now,
+		Bytes: size, StoragePath: relPath, CreatedBy: actorID, CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := repository.SaveRoomMedia(media); err != nil {
 		return model.RoomMediaView{}, err

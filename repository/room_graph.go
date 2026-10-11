@@ -2,6 +2,7 @@ package repository
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -99,6 +100,23 @@ func ApplyRoomBatch(roomID, userID, operationID, digest string, ops []contract.O
 		return model.RoomBatchResult{}, txErr
 	}
 	return result, nil
+}
+
+// FindRoomNode 读取房间内指定节点的当前行（含已删除标记）；不存在时 ok=false。
+func FindRoomNode(roomID, nodeID string) (model.RoomNode, bool, error) {
+	db, err := DB()
+	if err != nil {
+		return model.RoomNode{}, false, err
+	}
+	var row model.RoomNode
+	err = db.First(&row, "room_id = ? AND id = ?", strings.TrimSpace(roomID), strings.TrimSpace(nodeID)).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.RoomNode{}, false, nil
+	}
+	if err != nil {
+		return model.RoomNode{}, false, err
+	}
+	return row, true, nil
 }
 
 // ListRoomGraph 读取房间公共图（不含已删除节点/连线），按 ID 升序稳定返回。
