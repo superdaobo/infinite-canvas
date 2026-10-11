@@ -24,6 +24,11 @@ type Config struct {
 	LinuxDoUserInfoURL  string `env:"LINUX_DO_USERINFO_URL" envDefault:"https://connect.linux.do/api/user"`
 	AILogDir            string `env:"AI_LOG_DIR" envDefault:"data/logs/ai-calls"`
 	MediaDir            string `env:"MEDIA_DIR" envDefault:"data/collab-media"`
+	// SchoolExecutorToken 是学校受限执行设备的静态设备令牌（mock，见 #19）。
+	// 为空表示学校设备接口关闭；明文绝不写入仓库，仅由部署环境注入。
+	SchoolExecutorToken string `env:"SCHOOL_EXECUTOR_TOKEN"`
+	// SchoolExecutorID 是静态设备身份 ID，仅用于 mock 设备令牌认证。
+	SchoolExecutorID string `env:"SCHOOL_EXECUTOR_ID" envDefault:"school-device-local"`
 }
 
 var Cfg Config

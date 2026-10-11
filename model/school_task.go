@@ -192,8 +192,11 @@ type SchoolTask struct {
 	Status         SchoolTaskStatus `json:"status"`
 	Params         SchoolTaskParams `json:"params"`
 	Error          string           `json:"error,omitempty"`
-	CreatedAt      time.Time        `json:"createdAt"`
-	UpdatedAt      time.Time        `json:"updatedAt"`
+	// LastSeenAt 是执行设备最近一次心跳/回传时间（#18 持久化引入），
+	// 用于识别设备中断（stale running），不进入对外公开视图。
+	LastSeenAt *time.Time `json:"lastSeenAt,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
 }
 
 // SchoolTaskPublicView 是学校任务对外可见字段，明确不含学校凭据、Cookie、
