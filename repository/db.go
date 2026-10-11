@@ -87,6 +87,9 @@ func DB() (*gorm.DB, error) {
 			&model.Room{},
 			&model.RoomMember{},
 			&model.RoomInvite{},
+			&model.RoomNode{},
+			&model.RoomEdge{},
+			&model.RoomOperation{},
 		)
 	})
 	return db, dbErr

@@ -137,6 +137,8 @@ func New() *gin.Engine {
 		handler.CollabRevokeRoomInvite(c.Writer, c.Request, c.Param("id"), c.Param("inviteId"))
 	})
 	v1.POST("/collab/invites/accept", gin.WrapF(handler.CollabAcceptInvite))
+	v1.POST("/collab/rooms/:id/operations", func(c *gin.Context) { handler.CollabApplyOperations(c.Writer, c.Request, c.Param("id")) })
+	v1.GET("/collab/rooms/:id/graph", func(c *gin.Context) { handler.CollabRoomGraph(c.Writer, c.Request, c.Param("id")) })
 	api.GET("/proxy-image", gin.WrapF(handler.ProxyImage))
 	api.GET("/prompts", middleware.OptionalAuth, gin.WrapF(handler.Prompts))
 	api.GET("/agent-skills", gin.WrapF(handler.AgentSkills))
