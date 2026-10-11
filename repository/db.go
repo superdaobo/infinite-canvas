@@ -86,6 +86,7 @@ func DB() (*gorm.DB, error) {
 			&model.ComfyBridgeRequest{},
 			&model.Room{},
 			&model.RoomMember{},
+			&model.RoomInvite{},
 		)
 	})
 	return db, dbErr

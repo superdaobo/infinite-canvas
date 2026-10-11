@@ -136,6 +136,9 @@ func DeleteRoomCascade(roomID string) error {
 		if err := tx.Where("room_id = ?", roomID).Delete(&model.RoomMember{}).Error; err != nil {
 			return err
 		}
+		if err := DeleteRoomInvitesByRoom(tx, roomID); err != nil {
+			return err
+		}
 		return tx.Where("id = ?", roomID).Delete(&model.Room{}).Error
 	})
 }

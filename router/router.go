@@ -124,6 +124,19 @@ func New() *gin.Engine {
 	v1.POST("/collab/rooms", gin.WrapF(handler.CollabCreateRoom))
 	v1.GET("/collab/rooms/:id", func(c *gin.Context) { handler.CollabRoomDetail(c.Writer, c.Request, c.Param("id")) })
 	v1.DELETE("/collab/rooms/:id", func(c *gin.Context) { handler.CollabDeleteRoom(c.Writer, c.Request, c.Param("id")) })
+	v1.GET("/collab/rooms/:id/members", func(c *gin.Context) { handler.CollabRoomMembers(c.Writer, c.Request, c.Param("id")) })
+	v1.PATCH("/collab/rooms/:id/members/:userId", func(c *gin.Context) {
+		handler.CollabUpdateRoomMemberRole(c.Writer, c.Request, c.Param("id"), c.Param("userId"))
+	})
+	v1.DELETE("/collab/rooms/:id/members/:userId", func(c *gin.Context) {
+		handler.CollabRemoveRoomMember(c.Writer, c.Request, c.Param("id"), c.Param("userId"))
+	})
+	v1.GET("/collab/rooms/:id/invites", func(c *gin.Context) { handler.CollabRoomInvites(c.Writer, c.Request, c.Param("id")) })
+	v1.POST("/collab/rooms/:id/invites", func(c *gin.Context) { handler.CollabCreateRoomInvite(c.Writer, c.Request, c.Param("id")) })
+	v1.POST("/collab/rooms/:id/invites/:inviteId/revoke", func(c *gin.Context) {
+		handler.CollabRevokeRoomInvite(c.Writer, c.Request, c.Param("id"), c.Param("inviteId"))
+	})
+	v1.POST("/collab/invites/accept", gin.WrapF(handler.CollabAcceptInvite))
 	api.GET("/proxy-image", gin.WrapF(handler.ProxyImage))
 	api.GET("/prompts", middleware.OptionalAuth, gin.WrapF(handler.Prompts))
 	api.GET("/agent-skills", gin.WrapF(handler.AgentSkills))
