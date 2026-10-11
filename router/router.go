@@ -219,6 +219,7 @@ func New() *gin.Engine {
 	schoolBridge.POST("/claim", gin.WrapF(handler.BridgeSchoolClaim))
 	schoolBridge.POST("/update", gin.WrapF(handler.BridgeSchoolUpdate))
 	schoolBridge.POST("/finish", gin.WrapF(handler.BridgeSchoolFinish))
+	schoolBridge.POST("/result", gin.WrapF(handler.BridgeSchoolResult))
 	schoolBridge.POST("/recover", gin.WrapF(handler.BridgeSchoolRecover))
 	admin.POST("/storage/measure", gin.WrapF(handler.AdminMeasureStorageProvider))
 	admin.GET("/prompt-categories", gin.WrapF(handler.AdminPromptCategories))

@@ -203,7 +203,8 @@ func FinishSchoolTaskForExecutor(ctx context.Context, executorID, taskID string,
 	if err := ApplySchoolTaskTransition(&task, status); err != nil {
 		return model.SchoolTask{}, err
 	}
-	changed, err := repository.FinishRunningSchoolTask(taskID, executorID, status, strings.TrimSpace(errMsg))
+	// 失败信息先脱敏再落库：绝不把底层凭据写入任务记录或对外视图（#22 安全边界）。
+	changed, err := repository.FinishRunningSchoolTask(taskID, executorID, status, sanitizeSchoolFailure(errMsg))
 	if err != nil {
 		return model.SchoolTask{}, err
 	}

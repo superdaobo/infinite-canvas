@@ -87,6 +87,12 @@ func schoolErrorStatus(code string) int {
 		return http.StatusUnauthorized
 	case service.CodeSchoolTaskNotCancellable, service.CodeSchoolTaskNotRunning:
 		return http.StatusConflict
+	case service.CodeSchoolResultMissing:
+		return http.StatusConflict
+	case service.CodeSchoolResultInvalid:
+		return http.StatusUnprocessableEntity
+	case service.CodeSchoolResultUnreachable:
+		return http.StatusBadGateway
 	default:
 		return contract.StatusFor(code)
 	}
