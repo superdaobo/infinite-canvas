@@ -3,13 +3,14 @@
 import { useEffect, useState } from "react";
 
 import { fetchCollabRoom, fetchCollabRoomGraph, type CollabRoom, type CollabRoomGraph } from "@/services/api/collab-rooms";
+import type { CollabEdgeView, CollabNodeView } from "@/services/api/collab-realtime";
 import { useUserStore } from "@/stores/use-user-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata } from "../types";
 
 // 共享房间专用加载逻辑：只读取协作公共图，不写入个人画布 store/localforage。
 // 状态全部留在页面局部，切换或离开共享模式不会污染单人模式的本地持久化。
 
-const ROOM_NODE_KINDS = new Set<string>(Object.values(CanvasNodeType));
+export const ROOM_NODE_KINDS = new Set<string>(Object.values(CanvasNodeType));
 
 function parseRoomMetadata(raw: string): CanvasNodeMetadata {
     if (!raw) return {};
@@ -41,6 +42,24 @@ export function roomGraphToCanvas(graph: CollabRoomGraph) {
         .map((edge) => ({ id: edge.id, fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId }));
 
     return { nodes, connections };
+}
+
+// WS 广播节点视图 -> 画布节点。kind 不在 8 类白名单（含他人私有节点脱敏占位 kind:"private"）时返回 null。
+export function collabNodeViewToCanvas(view: CollabNodeView): CanvasNodeData | null {
+    if (!ROOM_NODE_KINDS.has(view.kind)) return null;
+    return {
+        id: view.id,
+        type: view.kind as CanvasNodeType,
+        title: view.title,
+        position: { x: view.position.x, y: view.position.y },
+        width: view.width,
+        height: view.height,
+        metadata: (view.metadata as CanvasNodeMetadata | undefined) ?? {},
+    };
+}
+
+export function collabEdgeViewToConnection(edge: CollabEdgeView): CanvasConnection {
+    return { id: edge.id, fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId };
 }
 
 export function useCollabRoomGraph(roomId: string, enabled: boolean) {

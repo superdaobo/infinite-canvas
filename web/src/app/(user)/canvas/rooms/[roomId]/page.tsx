@@ -2,9 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { AlertTriangle, ChevronLeft, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, ChevronLeft, Loader2, MousePointer2, Plus, RefreshCw, Trash2, Users, Wifi, WifiOff } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
+import type { CollabCursorInfo } from "@/services/api/collab-realtime";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasNode } from "../../components/canvas-node";
 import { ConnectionPath } from "../../components/canvas-connections";
@@ -12,13 +13,54 @@ import { InfiniteCanvas } from "../../components/infinite-canvas";
 import { isSharedCanvasEnabled } from "../../mode";
 import type { Position, ViewportTransform } from "../../types";
 import { useCollabRoomEditing } from "../use-collab-room-editing";
+import { useCollabRoomRealtime, type CollabRealtimeStatus } from "../use-collab-room-realtime";
 
 // 共享房间画布入口：/canvas/rooms/:roomId
 // 与单人项目路由 /canvas/:projectId 完全分离，使用独立状态边界（不使用 useCanvasStore）。
 // 编辑能力按 #13 交付：节点/连线变更构造为协作操作并经服务端回执确认（见 use-collab-room-editing）。
+// 实时接收按 #14 交付：ticket 建连、分帧快照、changes、presence、cursors 与断线恢复（见 use-collab-room-realtime）。
 
 const noop = () => undefined;
 const TEXT_NODE_SIZE = { width: 360, height: 200 };
+
+// 协作光标配色：按 userId 稳定取色，保证同一成员各端颜色一致。
+const CURSOR_COLORS = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899"];
+
+function cursorColor(userId: string) {
+    let hash = 0;
+    for (let index = 0; index < userId.length; index += 1) hash = (hash * 31 + userId.charCodeAt(index)) >>> 0;
+    return CURSOR_COLORS[hash % CURSOR_COLORS.length];
+}
+
+const REALTIME_STATUS_LABEL: Record<CollabRealtimeStatus, string> = {
+    connecting: "连接中",
+    connected: "已连接",
+    reconnecting: "重连中",
+    revoked: "访问失效",
+    offline: "离线",
+};
+
+// 他人协作光标：在画布世界坐标层内渲染，用反向缩放保持图标恒定大小。
+function RemoteCursorLayer({ cursors }: { cursors: CollabCursorInfo[] }) {
+    if (!cursors.length) return null;
+    return (
+        <div className="pointer-events-none absolute left-0 top-0 z-[60]">
+            {cursors.map((cursor) => {
+                const color = cursorColor(cursor.userId);
+                return (
+                    <div key={cursor.userId} className="absolute" style={{ transform: `translate(${cursor.position.x}px, ${cursor.position.y}px)` }}>
+                        <div className="flex items-start" style={{ transform: "scale(var(--canvas-inverse-scale, 1))", transformOrigin: "top left" }}>
+                            <MousePointer2 className="size-4" style={{ color, fill: color }} />
+                            <span className="ml-0.5 whitespace-nowrap rounded px-1 text-[11px] leading-4 text-white shadow" style={{ background: color }}>
+                                {cursor.username}
+                            </span>
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
 
 type Connecting = { nodeId: string; handleType: "source" | "target" };
 
@@ -46,7 +88,15 @@ export default function CollabRoomPage() {
         disconnectEdge,
         flushNow,
         retryPending,
+        applyRemoteChanges,
+        applyRemoteSnapshot,
     } = useCollabRoomEditing(params.roomId, sharedEnabled);
+    // 实时接收与在线状态（#14）：断线重连后本地未确认草稿由编辑层保留，重连时自动补发。
+    const { status: realtimeStatus, members, cursors, error: realtimeError, sendCursor } = useCollabRoomRealtime(params.roomId, sharedEnabled, revision, {
+        applyRemoteChanges,
+        applyRemoteSnapshot,
+        resumePending: retryPending,
+    });
     const colorTheme = useThemeStore((state) => state.theme);
     const theme = canvasThemes[colorTheme];
     const containerRef = useRef<HTMLDivElement>(null);
@@ -65,7 +115,9 @@ export default function CollabRoomPage() {
     const selectedConnectionRef = useRef<string | null>(null);
     selectedConnectionRef.current = selectedConnectionId;
     const canEditRef = useRef(canEdit);
-    canEditRef.current = canEdit;
+    // 访问失效（权限被撤销）后立即停止编辑，不再接受协作广播。
+    const editable = canEdit && realtimeStatus !== "revoked";
+    canEditRef.current = editable;
     const dragRef = useRef<{ id: string; startX: number; startY: number; origin: Position; moved: boolean } | null>(null);
 
     useEffect(() => setMounted(true), []);
@@ -96,6 +148,20 @@ export default function CollabRoomPage() {
         window.addEventListener("mouseup", handleMouseUp);
         return () => window.removeEventListener("mouseup", handleMouseUp);
     }, []);
+
+    // 上报本端协作光标：换算为画布世界坐标，客户端节流后由服务端再次节流合并。
+    useEffect(() => {
+        if (!mounted) return;
+        const container = containerRef.current;
+        if (!container) return;
+        const handlePointerMove = (event: PointerEvent) => {
+            const rect = container.getBoundingClientRect();
+            const current = viewportRef.current;
+            sendCursor({ x: (event.clientX - rect.left - current.x) / current.k, y: (event.clientY - rect.top - current.y) / current.k });
+        };
+        container.addEventListener("pointermove", handlePointerMove);
+        return () => container.removeEventListener("pointermove", handlePointerMove);
+    }, [mounted, sendCursor]);
 
     // 键盘删除选中节点/连线；输入态不拦截。
     useEffect(() => {
@@ -229,11 +295,23 @@ export default function CollabRoomPage() {
                 <div className="flex h-9 items-center gap-2 rounded-lg border px-3 text-sm backdrop-blur" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}>
                     <span className="font-medium">{room?.title || "共享画布"}</span>
                     <span className="rounded px-1.5 py-0.5 text-xs opacity-70" style={{ background: theme.canvas.background }}>
-                        {canEdit ? "可编辑" : "只读"}
+                        {editable ? "可编辑" : "只读"}
                     </span>
                     <span className="text-xs opacity-60">r{revision}</span>
                 </div>
-                {canEdit ? (
+                <div className="flex h-9 items-center gap-2 rounded-lg border px-3 text-sm backdrop-blur" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}>
+                    <Users className="size-4" />
+                    <span className="font-medium">在线 {members.length}</span>
+                    {members.length ? <span className="max-w-[200px] truncate text-xs opacity-70">{members.map((member) => member.username).join("、")}</span> : null}
+                </div>
+                <div
+                    className="flex h-9 items-center gap-1 rounded-lg border px-3 text-xs backdrop-blur"
+                    style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: realtimeStatus === "revoked" ? "#ef4444" : theme.node.text }}
+                >
+                    {realtimeStatus === "connected" ? <Wifi className="size-3.5" /> : <WifiOff className="size-3.5" />}
+                    {REALTIME_STATUS_LABEL[realtimeStatus]}
+                </div>
+                {editable ? (
                     <button
                         type="button"
                         onClick={handleCreateTextNode}
@@ -244,7 +322,7 @@ export default function CollabRoomPage() {
                         新建文本节点
                     </button>
                 ) : null}
-                {canEdit && hasSelection ? (
+                {editable && hasSelection ? (
                     <button
                         type="button"
                         onClick={() => {
@@ -299,7 +377,7 @@ export default function CollabRoomPage() {
                     <CanvasNode
                         key={node.id}
                         data={node}
-                        readOnly={!canEdit}
+                        readOnly={!editable}
                         scale={viewport.k}
                         isSelected={selectedNodeIds.has(node.id)}
                         isRelated={false}
@@ -321,7 +399,17 @@ export default function CollabRoomPage() {
                         onContextMenu={(event) => event.preventDefault()}
                     />
                 ))}
+
+                <RemoteCursorLayer cursors={cursors} />
             </InfiniteCanvas>
+
+            {realtimeStatus === "revoked" ? (
+                <div className="pointer-events-none absolute inset-x-0 top-16 z-[95] grid place-items-center">
+                    <div className="rounded-lg border px-5 py-3 text-sm" style={{ background: theme.toolbar.panel, borderColor: "#ef4444", color: "#ef4444" }}>
+                        {realtimeError?.message || "协作访问已失效，请刷新页面"}
+                    </div>
+                </div>
+            ) : null}
 
             {pending.count > 0 || pending.error ? (
                 <div

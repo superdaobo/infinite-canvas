@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { fetchCollabRoom, fetchCollabRoomGraph, type CollabRoom } from "@/services/api/collab-rooms";
 import { CollabOperationError, submitCollabOperations, type CollabOperation, type CollabRoomChange } from "@/services/api/collab-operations";
+import type { CollabChangeView, CollabEdgeView, CollabNodeView } from "@/services/api/collab-realtime";
 import { useUserStore } from "@/stores/use-user-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type Position } from "../types";
 import {
@@ -17,7 +18,7 @@ import {
     newNodeId,
     newOperationId,
 } from "./collab-operation-builders";
-import { roomGraphToCanvas } from "./use-collab-room-graph";
+import { collabEdgeViewToConnection, collabNodeViewToCanvas, roomGraphToCanvas } from "./use-collab-room-graph";
 
 // 共享房间编辑闭环：本地乐观应用 + 后台合并提交 + 服务端回执确认。
 //
@@ -105,6 +106,145 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
                 deletedEdgesRef.current.delete(change.edge.id);
             }
         }
+    }
+
+    // 远端增量（WS changes）应用到本地共享画布，与本地乐观操作合并：
+    // - 本地未确认草稿（dirty）目标优先，远端不覆盖、不删除，草稿不丢；
+    // - 本地待删除目标不因远端 upsert 复活，但同步服务端版本让删除命中正确版本；
+    // - 其余目标按 id 幂等 upsert/delete，并用服务端 version 去重，重复事件不重复创建内容。
+    function applyRemoteChanges(changes: CollabChangeView[]) {
+        if (!changes.length) return;
+        let nextNodes = nodesRef.current;
+        let nextConnections = connectionsRef.current;
+        let nodesChanged = false;
+        let connectionsChanged = false;
+
+        for (const change of changes) {
+            if (change.type === "upsert" && change.node) {
+                const view = change.node;
+                if (deletedNodesRef.current.has(view.id)) {
+                    nodeVersionsRef.current.set(view.id, view.version);
+                    continue;
+                }
+                if (dirtyNodesRef.current.has(view.id)) continue;
+                if (nodeVersionsRef.current.get(view.id) === view.version) continue;
+                nodeVersionsRef.current.set(view.id, view.version);
+                const node = collabNodeViewToCanvas(view);
+                if (!node) continue;
+                const index = nextNodes.findIndex((item) => item.id === node.id);
+                if (index === -1) nextNodes = [...nextNodes, node];
+                else {
+                    nextNodes = nextNodes.slice();
+                    nextNodes[index] = node;
+                }
+                nodesChanged = true;
+            } else if (change.type === "delete" && change.node) {
+                const id = change.node.id;
+                if (dirtyNodesRef.current.has(id)) continue;
+                nodeVersionsRef.current.delete(id);
+                if (nextNodes.some((item) => item.id === id)) {
+                    nextNodes = nextNodes.filter((item) => item.id !== id);
+                    nodesChanged = true;
+                }
+                if (nextConnections.some((edge) => edge.fromNodeId === id || edge.toNodeId === id)) {
+                    nextConnections = nextConnections.filter((edge) => edge.fromNodeId !== id && edge.toNodeId !== id);
+                    connectionsChanged = true;
+                }
+            } else if (change.type === "edge-upsert" && change.edge) {
+                const view = change.edge;
+                if (deletedEdgesRef.current.has(view.id)) {
+                    edgeVersionsRef.current.set(view.id, view.version);
+                    continue;
+                }
+                if (dirtyEdgesRef.current.has(view.id)) continue;
+                if (edgeVersionsRef.current.get(view.id) === view.version) continue;
+                edgeVersionsRef.current.set(view.id, view.version);
+                const edge = collabEdgeViewToConnection(view);
+                const index = nextConnections.findIndex((item) => item.id === edge.id);
+                if (index === -1) nextConnections = [...nextConnections, edge];
+                else {
+                    nextConnections = nextConnections.slice();
+                    nextConnections[index] = edge;
+                }
+                connectionsChanged = true;
+            } else if (change.type === "edge-delete" && change.edge) {
+                const id = change.edge.id;
+                if (dirtyEdgesRef.current.has(id)) continue;
+                edgeVersionsRef.current.delete(id);
+                if (nextConnections.some((edge) => edge.id === id)) {
+                    nextConnections = nextConnections.filter((edge) => edge.id !== id);
+                    connectionsChanged = true;
+                }
+            }
+        }
+
+        if (nodesChanged) commitNodes(nextNodes);
+        if (connectionsChanged) commitConnections(nextConnections);
+    }
+
+    // 断线重连后按分帧快照重建本地图，规则与 applyRemoteChanges 一致：本地未确认草稿优先保留。
+    function applyRemoteSnapshot(snapshot: { revision: number; nodes: CollabNodeView[]; edges: CollabEdgeView[] }) {
+        const draftNodes = new Map<string, CanvasNodeData>();
+        nodesRef.current.forEach((node) => {
+            if (dirtyNodesRef.current.has(node.id)) draftNodes.set(node.id, node);
+        });
+        const draftEdges = new Map<string, CanvasConnection>();
+        connectionsRef.current.forEach((edge) => {
+            if (dirtyEdgesRef.current.has(edge.id)) draftEdges.set(edge.id, edge);
+        });
+
+        const nodeVersions = new Map<string, number>();
+        const nextNodes: CanvasNodeData[] = [];
+        for (const view of snapshot.nodes) {
+            nodeVersions.set(view.id, view.version);
+            if (deletedNodesRef.current.has(view.id)) continue;
+            const draft = draftNodes.get(view.id);
+            if (draft) {
+                nextNodes.push(draft);
+                continue;
+            }
+            const node = collabNodeViewToCanvas(view);
+            if (node) nextNodes.push(node);
+        }
+        // 快照里没有、但本地有未确认新建草稿的节点必须保留。
+        draftNodes.forEach((node, id) => {
+            if (!nextNodes.some((item) => item.id === id)) nextNodes.push(node);
+        });
+        // 草稿目标保留本地已知版本（未确认新建保持无版本），让冲突按契约由后续提交暴露。
+        draftNodes.forEach((_node, id) => {
+            const known = nodeVersionsRef.current.get(id);
+            if (known === undefined) nodeVersions.delete(id);
+            else nodeVersions.set(id, known);
+        });
+
+        const nodeIds = new Set(nextNodes.map((node) => node.id));
+        const edgeVersions = new Map<string, number>();
+        const nextConnections: CanvasConnection[] = [];
+        for (const view of snapshot.edges) {
+            edgeVersions.set(view.id, view.version);
+            if (deletedEdgesRef.current.has(view.id)) continue;
+            const draft = draftEdges.get(view.id);
+            if (draft) {
+                nextConnections.push(draft);
+                continue;
+            }
+            if (!nodeIds.has(view.fromNodeId) || !nodeIds.has(view.toNodeId)) continue;
+            nextConnections.push(collabEdgeViewToConnection(view));
+        }
+        draftEdges.forEach((edge, id) => {
+            if (!nextConnections.some((item) => item.id === id)) nextConnections.push(edge);
+        });
+        draftEdges.forEach((_edge, id) => {
+            const known = edgeVersionsRef.current.get(id);
+            if (known === undefined) edgeVersions.delete(id);
+            else edgeVersions.set(id, known);
+        });
+
+        nodeVersionsRef.current = nodeVersions;
+        edgeVersionsRef.current = edgeVersions;
+        commitNodes(nextNodes);
+        commitConnections(nextConnections);
+        setRevision(snapshot.revision);
     }
 
     // 把当前待发送标记合并成一批操作。同一目标只出现一次，天然满足契约 duplicate_target 约束。
@@ -395,5 +535,7 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         disconnectEdge,
         flushNow,
         retryPending,
+        applyRemoteChanges,
+        applyRemoteSnapshot,
     };
 }
