@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tigerowo/infinite-canvas/internal/collab/contract"
@@ -22,6 +23,26 @@ var (
 	ErrSchoolTaskForbidden = errors.New("无权提交学校任务")
 )
 
+// schoolTaskClock 保证同一进程内 school_tasks.created_at 严格单调递增。
+// FIFO 领取按 created_at 排序，而任务 ID 是幂等键的哈希、不携带提交顺序，
+// 因此同一微秒内的两次提交若 created_at 相同，排序会退化为按哈希 ID 决序而不确定。
+// 这里对同微秒或时钟回拨的情况逐微秒前移，保证「后提交的 created_at 更大」。
+var schoolTaskClock struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func nextSchoolTaskCreatedAt() time.Time {
+	schoolTaskClock.mu.Lock()
+	defer schoolTaskClock.mu.Unlock()
+	now := time.Now().UTC()
+	if !now.After(schoolTaskClock.last) {
+		now = schoolTaskClock.last.Add(time.Microsecond)
+	}
+	schoolTaskClock.last = now
+	return now
+}
+
 // NewSchoolTask 构造一个待提交的 queued 学校任务：派生确定性任务 ID，记录真实
 // 提交人，并校验房间、身份与渠道参数。重复提交由 ResolveSchoolTaskIdempotency 处理。
 func NewSchoolTask(roomID, submittedBy string, channel model.SchoolChannel, clientTaskID string, params model.SchoolTaskParams) (model.SchoolTask, error) {
@@ -31,7 +52,7 @@ func NewSchoolTask(roomID, submittedBy string, channel model.SchoolChannel, clie
 	}
 	roomID = strings.TrimSpace(roomID)
 	submittedBy = strings.TrimSpace(submittedBy)
-	now := time.Now().UTC()
+	now := nextSchoolTaskCreatedAt()
 	task := model.SchoolTask{
 		ID:           model.SchoolTaskID(roomID, submittedBy, clientTaskID),
 		RoomID:       roomID,

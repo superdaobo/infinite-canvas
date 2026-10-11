@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -341,5 +342,56 @@ func TestMockSchoolUpstreamClient(t *testing.T) {
 	}
 	if _, err := client.Query(context.Background(), "missing"); err == nil {
 		t.Fatal("查询不存在的 mock 上游任务应报错")
+	}
+}
+
+// TestSchoolTaskCreatedAtStrictlyMonotonic 验证 created_at 生成器在同一微秒内仍严格
+// 递增。任务 ID 是幂等键哈希、不携带提交顺序，所以 created_at 一旦出现相等，FIFO 排序
+// 就会退化为按哈希 ID 决序而不确定；这是 #18 FIFO 偶发失败的根因。
+func TestSchoolTaskCreatedAtStrictlyMonotonic(t *testing.T) {
+	prev := nextSchoolTaskCreatedAt()
+	for i := 0; i < 5000; i++ {
+		now := nextSchoolTaskCreatedAt()
+		if !now.After(prev) {
+			t.Fatalf("created_at 未严格递增：第 %d 次 %v <= 前一次 %v", i, now, prev)
+		}
+		prev = now
+	}
+}
+
+// TestSchoolTaskQueueFIFOOrderUnderRapidSubmit 密集提交 10 个任务，验证队列可见顺序
+// 严格等于提交顺序，且首个 running lease 是先提交的那个。
+func TestSchoolTaskQueueFIFOOrderUnderRapidSubmit(t *testing.T) {
+	env := setupSchoolTestEnv(t)
+	const n = 10
+	submitted := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ctx := env.ctxA
+		prefix := "a"
+		if i%2 == 1 {
+			ctx = env.ctxB
+			prefix = "b"
+		}
+		task := mustSubmit(t, ctx, env, model.SchoolChannelQwen, "rapid-"+prefix+"-"+strconv.Itoa(i),
+			model.SchoolTaskParams{Prompt: "p"})
+		submitted = append(submitted, task.ID)
+	}
+
+	queue, err := ListRoomSchoolTasks(env.ctxA, env.roomID)
+	if err != nil {
+		t.Fatalf("读取队列失败: %v", err)
+	}
+	if queue.Total != int64(n) {
+		t.Fatalf("队列任务数应为 %d，实际 %d", n, queue.Total)
+	}
+	for i, view := range queue.Items {
+		if view.ID != submitted[i] {
+			t.Fatalf("队列第 %d 项应为 %s，实际 %s（FIFO 顺序不确定）", i, submitted[i], view.ID)
+		}
+	}
+
+	running, ok := mustClaim(t, "executor-fifo")
+	if !ok || running.ID != submitted[0] {
+		t.Fatalf("首个 running lease 应为最先提交的 %s，实际 ok=%v task=%+v", submitted[0], ok, running)
 	}
 }
