@@ -38,6 +38,7 @@ description: 当前后端主要数据表与字段说明
 - `storage_objects`
 - `collab_rooms`
 - `collab_room_members`
+- `collab_room_invites`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -399,6 +400,27 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 索引：`idx_collab_room_members_user (user_id)`
 
 删除房间时在同一事务内级联删除该房间的成员关系；该操作只作用于协作房间表，不改动个人画布。
+
+
+### collab_room_invites
+
+协作房间邀请表（协作 v1）。一条记录表示一个可撤销的分享链接；数据库只保存令牌的 SHA-256 哈希，明文令牌仅在创建响应里返回一次。邀请只能授予 `editor` 或 `viewer`，不能授予 `owner`；撤销或过期后令牌立即失效。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 邀请 ID，主键（可公开用于管理，不泄漏令牌） |
+| `room_id` | string | 房间 ID |
+| `role` | string | 邀请授予的角色：`editor`、`viewer` |
+| `token_hash` | string | 邀请令牌的 SHA-256 哈希，唯一索引，绝不返回给客户端 |
+| `created_by` | string | 创建邀请的 owner 用户 ID |
+| `expires_at` | datetime | 邀请过期时间 |
+| `revoked_at` | datetime | 撤销时间，空表示未撤销 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_collab_room_invites_room (room_id)`、`token_hash` 唯一索引
+
+删除房间时在同一事务内级联删除该房间的邀请记录。
 
 
 ### settings
