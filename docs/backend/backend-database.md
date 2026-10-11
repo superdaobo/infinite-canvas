@@ -43,6 +43,7 @@ description: 当前后端主要数据表与字段说明
 - `collab_room_edges`
 - `collab_room_operations`
 - `collab_room_media`
+- `school_tasks`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -496,6 +497,35 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 索引：`idx_collab_room_media_room_created (room_id, updated_at)`
 
 删除房间时在同一事务内级联删除该房间的媒体索引；blob 采用内容寻址，删除记录后若已无其他房间引用同一内容才回收文件。
+
+
+### school_tasks
+
+学校共享生成任务队列表（协作 v1，C03-02）。房间成员提交任务后按 FIFO 串行执行，全局只有一个执行中任务（单执行槽）。表名不带 `collab_` 前缀，因为它是学校渠道专用队列，与房间图/媒体表分离。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键，由 `(room_id, submitted_by, client_task_id)` 确定性派生 |
+| `room_id` | string | 所属协作房间 |
+| `submitted_by` | string | 真实提交人用户 ID（非执行设备） |
+| `client_task_id` | string | 提交端生成的幂等键 |
+| `executor_id` | string | 受限执行设备身份；未领取时为空 |
+| `upstream_task_id` | string | 上游学校任务号，首次绑定后不可替换 |
+| `channel` | string | 学校渠道：`qwen`（文生图）、`h3`（1–9 参考图视频） |
+| `status` | string | 状态机：`queued`、`running`、`succeeded`、`failed`、`cancelled` |
+| `params_json` | text | 生成参数 JSON（prompt、有序参考图、秒数等） |
+| `error` | text | 失败原因或恢复说明（可审计） |
+| `running_slot` | number | 仅 running 任务写入 `1`，其余为 NULL |
+| `last_seen_at` | datetime | 执行设备最近心跳时间，用于识别中断 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引与约束：
+
+- `idx_school_tasks_idem (room_id, submitted_by, client_task_id)` 唯一索引：保证重复提交幂等，不触发第二次学校执行。
+- `idx_school_tasks_one_running (running_slot)` 唯一索引：只有 running 任务写非 NULL 槽位，其余为 NULL。利用 SQLite/MySQL/PostgreSQL「唯一索引不把多个 NULL 视为重复」的语义，在数据库层保证**全局最多一个 running 任务**（单执行槽）。
+- `idx_school_tasks_queue (status, created_at)`：队列按 `created_at, id` 升序 FIFO 领取。
+
+领取走单事务：先确认没有 running，再取最早的 queued 任务并置为 running；并发事务由 `running_slot` 唯一索引兜底，不会双领。服务重启或设备中断后 running 任务**保持 running**、保留 `upstream_task_id` 与设备绑定，绝不自动改回 queued，也不重复生成；恢复由设备显式调用 `/api/bridge/school/recover` 完成（写 `error` 作为审计说明）。
 
 
 ### settings

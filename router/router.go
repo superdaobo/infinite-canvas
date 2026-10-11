@@ -161,6 +161,16 @@ func New() *gin.Engine {
 	v1.DELETE("/collab/rooms/:id/media/:mediaId", func(c *gin.Context) {
 		handler.CollabDeleteRoomMedia(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
 	})
+	// 学校共享生成任务队列（C03-02）：提交/列表/取消，均按房间成员鉴权。
+	v1.POST("/collab/rooms/:id/school-tasks", func(c *gin.Context) {
+		handler.CollabSubmitSchoolTask(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/collab/rooms/:id/school-tasks", func(c *gin.Context) {
+		handler.CollabRoomSchoolTasks(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.POST("/collab/rooms/:id/school-tasks/:taskId/cancel", func(c *gin.Context) {
+		handler.CollabCancelSchoolTask(c.Writer, c.Request, c.Param("id"), c.Param("taskId"))
+	})
 	// WS 升级端点不挂 UserAuth：身份由首帧 hello 的 ticket 绑定，JWT 不入 URL。
 	api.GET("/v1/collab/rooms/:id/ws", func(c *gin.Context) {
 		handler.CollabWS(c.Writer, c.Request, c.Param("id"))
@@ -204,6 +214,12 @@ func New() *gin.Engine {
 	bridge.GET("/poll", gin.WrapF(handler.BridgeComfyPoll))
 	bridge.POST("/lease", gin.WrapF(handler.BridgeComfyLease))
 	bridge.POST("/result", gin.WrapF(handler.BridgeComfyResult))
+	// 学校受限执行设备接口（C03-02）：独立分组、Bearer 设备令牌，与用户 JWT 分离。
+	schoolBridge := api.Group("/bridge/school")
+	schoolBridge.POST("/claim", gin.WrapF(handler.BridgeSchoolClaim))
+	schoolBridge.POST("/update", gin.WrapF(handler.BridgeSchoolUpdate))
+	schoolBridge.POST("/finish", gin.WrapF(handler.BridgeSchoolFinish))
+	schoolBridge.POST("/recover", gin.WrapF(handler.BridgeSchoolRecover))
 	admin.POST("/storage/measure", gin.WrapF(handler.AdminMeasureStorageProvider))
 	admin.GET("/prompt-categories", gin.WrapF(handler.AdminPromptCategories))
 	admin.POST("/prompt-categories/sync", gin.WrapF(handler.AdminSyncPromptCategories))
