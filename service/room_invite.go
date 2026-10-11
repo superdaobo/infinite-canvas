@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tigerowo/infinite-canvas/internal/collab/realtime"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/repository"
 )
@@ -218,6 +219,8 @@ func RemoveRoomMember(ctx context.Context, roomID, targetUserID string) error {
 	if !removed {
 		return ErrRoomNotFound
 	}
+	// 成员被移除后立即关闭其在该房间的全部 WS 连接（安全边界 N8）。
+	realtime.Default.DisconnectUser(strings.TrimSpace(roomID), targetUserID, "成员已被移除")
 	return nil
 }
 
@@ -251,6 +254,10 @@ func UpdateRoomMemberRole(ctx context.Context, roomID, targetUserID, role string
 	}
 	if _, err := repository.UpdateRoomMemberRole(strings.TrimSpace(roomID), targetUserID, newRole); err != nil {
 		return model.RoomMemberView{}, err
+	}
+	// 权限降低为 viewer 后，已建立的 WS 必须失效，强制按新角色重连（写操作另有二次鉴权）。
+	if newRole == model.RoomRoleViewer {
+		realtime.Default.DisconnectUser(strings.TrimSpace(roomID), targetUserID, "成员权限已降低")
 	}
 	user, _, err := repository.GetUserByID(targetUserID)
 	if err != nil {
