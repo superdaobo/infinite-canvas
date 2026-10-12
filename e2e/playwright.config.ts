@@ -1,5 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
-import { BACKEND_PORT, BACKEND_URL, FRONTEND_URL, REPO_ROOT, WEB_DIR } from "./fixtures/env";
+import { BACKEND_PORT, BACKEND_URL, COLLAB_WS_BASE, FRONTEND_URL, REPO_ROOT, WEB_DIR } from "./fixtures/env";
 
 /**
  * 一条命令（npm test / npx playwright test）即可拉起本地 Go 后端（sqlite）与 Next.js 前端。
@@ -60,6 +60,11 @@ export default defineConfig({
             timeout: 300_000,
             env: {
                 API_BASE_URL: BACKEND_URL,
+                // Next 的 /api/[...path] 只能代理普通 HTTP，无法代理 WebSocket 升级。
+                // 前端已支持用 NEXT_PUBLIC_COLLAB_WS_BASE 覆盖协作 WS 地址（见
+                // web/src/services/api/collab-realtime.ts::buildCollabWSURL），
+                // 这里让浏览器直连 Go 后端的 WS 端点，绕开 Next 代理。
+                NEXT_PUBLIC_COLLAB_WS_BASE: COLLAB_WS_BASE,
             },
             stdout: "pipe",
             stderr: "pipe",
