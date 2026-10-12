@@ -7,6 +7,7 @@ import { CollabOperationError, submitCollabOperations, type CollabOperation, typ
 import type { CollabChangeView, CollabEdgeView, CollabNodeView } from "@/services/api/collab-realtime";
 import { useUserStore } from "@/stores/use-user-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type Position } from "../types";
+import { clearRoomDraft, loadRoomDraft, saveRoomDraft } from "./collab-draft-store";
 import {
     buildConnectOperation,
     buildCreateOperation,
@@ -18,23 +19,37 @@ import {
     newNodeId,
     newOperationId,
 } from "./collab-operation-builders";
-import { collabEdgeViewToConnection, collabNodeViewToCanvas, roomGraphToCanvas } from "./use-collab-room-graph";
+import { collabEdgeViewToConnection, collabNodeViewToCanvas, collabRoomChangeToView, roomGraphToCanvas } from "./use-collab-room-graph";
 
 // 共享房间编辑闭环：本地乐观应用 + 后台合并提交 + 服务端回执确认。
 //
 // - 本地状态先改先显示，变更按目标（节点/连线）合并去重后成批发往
 //   POST /api/v1/collab/rooms/:id/operations；
 // - 服务端确认后按 changes 回写版本（客户端版本与服务端一致），revision 前进；
-// - 失败（版本冲突/非法/网络）不回滚本地状态、不清除待发送标记，草稿保留，
-//   并通过 pending.error 暴露可观测的待处理状态；完整冲突交互留给 #15。
+// - 失败（版本冲突/非法/网络）不回滚本地状态、不清除待发送标记，草稿保留；
+//   version_conflict / edge_changed / node_deleted 会以 conflict 暴露服务端最新状态，
+//   由页面提供「用服务端最新版本 / 保留本地草稿并重试」两种处理，绝不静默丢弃输入（#15）；
+// - 未确认草稿按房间+用户写入 localforage，刷新后恢复并补发，提交成功后清除（#15）。
 //
 // 版本以 Map 独立保存，不改动热点文件 types.ts / use-canvas-store.ts。
 
 const FLUSH_DEBOUNCE_MS = 350;
+const DRAFT_PERSIST_DEBOUNCE_MS = 250;
 const MAX_OPERATIONS_PER_BATCH = 200;
 
 export type CollabPendingError = { code: string; message: string; network: boolean };
 export type CollabPendingState = { count: number; sending: boolean; error: CollabPendingError | null };
+
+// 版本冲突（服务端 409）的可处理状态：附带服务端最新节点，供页面展示差异与安全应用。
+export type CollabConflict = {
+    code: string;
+    message: string;
+    targetKind: "node" | "edge";
+    targetId: string;
+    serverVersion: number | null;
+    serverNode: CanvasNodeData | null;
+    localNode: CanvasNodeData | null;
+};
 
 type Target = { kind: "node" | "edge"; id: string };
 
@@ -43,8 +58,63 @@ function toPendingError(error: unknown): CollabPendingError {
     return { code: "unknown_error", message: error instanceof Error ? error.message : "协作操作失败", network: false };
 }
 
+function asFiniteNumber(value: unknown): number | null {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+// 解析契约错误 details.node（contract.Node）为画布节点与其版本；字段非法时返回 null。
+function parseConflictNode(raw: unknown): { node: CanvasNodeData; version: number } | null {
+    if (!raw || typeof raw !== "object") return null;
+    const node = raw as { id?: unknown; kind?: unknown; title?: unknown; position?: { x?: unknown; y?: unknown }; width?: unknown; height?: unknown; version?: unknown; metadata?: unknown };
+    if (typeof node.id !== "string" || typeof node.kind !== "string") return null;
+    return {
+        node: {
+            id: node.id,
+            type: node.kind as CanvasNodeType,
+            title: typeof node.title === "string" ? node.title : "",
+            position: { x: asFiniteNumber(node.position?.x) ?? 0, y: asFiniteNumber(node.position?.y) ?? 0 },
+            width: asFiniteNumber(node.width) ?? 0,
+            height: asFiniteNumber(node.height) ?? 0,
+            metadata: node.metadata && typeof node.metadata === "object" ? (node.metadata as CanvasNodeData["metadata"]) : {},
+        },
+        version: asFiniteNumber(node.version) ?? 0,
+    };
+}
+
+// 把契约 409 错误转换为可处理冲突；非冲突错误返回 null，交给通用错误提示。
+function toConflict(error: unknown, localNodes: CanvasNodeData[]): CollabConflict | null {
+    if (!(error instanceof CollabOperationError)) return null;
+    const details = error.details || {};
+    if (error.code === "version_conflict") {
+        const parsed = parseConflictNode(details.node);
+        const targetId = parsed?.node.id || (typeof details.nodeId === "string" ? details.nodeId : "");
+        if (!targetId) return null;
+        return {
+            code: error.code,
+            message: error.message,
+            targetKind: "node",
+            targetId,
+            serverVersion: parsed?.version ?? asFiniteNumber(details.currentVersion),
+            serverNode: parsed?.node ?? null,
+            localNode: localNodes.find((node) => node.id === targetId) ?? null,
+        };
+    }
+    if (error.code === "edge_changed") {
+        const targetId = typeof details.edgeId === "string" ? details.edgeId : "";
+        if (!targetId) return null;
+        return { code: error.code, message: error.message, targetKind: "edge", targetId, serverVersion: asFiniteNumber(details.version), serverNode: null, localNode: null };
+    }
+    if (error.code === "node_deleted") {
+        const targetId = typeof details.nodeId === "string" ? details.nodeId : "";
+        if (!targetId) return null;
+        return { code: error.code, message: error.message, targetKind: "node", targetId, serverVersion: null, serverNode: null, localNode: localNodes.find((node) => node.id === targetId) ?? null };
+    }
+    return null;
+}
+
 export function useCollabRoomEditing(roomId: string, enabled: boolean) {
     const token = useUserStore((state) => state.token);
+    const userId = useUserStore((state) => state.user?.id ?? "");
     const [room, setRoom] = useState<CollabRoom | null>(null);
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
     const [connections, setConnections] = useState<CanvasConnection[]>([]);
@@ -52,6 +122,7 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [pending, setPending] = useState<CollabPendingState>({ count: 0, sending: false, error: null });
+    const [conflict, setConflict] = useState<CollabConflict | null>(null);
 
     const nodesRef = useRef<CanvasNodeData[]>([]);
     const connectionsRef = useRef<CanvasConnection[]>([]);
@@ -71,6 +142,12 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
     const attemptRef = useRef<{ operationId: string; signature: string } | null>(null);
     const roomIdRef = useRef(roomId);
     roomIdRef.current = roomId;
+    const userIdRef = useRef(userId);
+    userIdRef.current = userId;
+    const revisionRef = useRef(revision);
+    revisionRef.current = revision;
+    const conflictRef = useRef<CollabConflict | null>(null);
+    const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     function hasDirty() {
         return dirtyNodesRef.current.size > 0 || dirtyEdgesRef.current.size > 0;
@@ -78,6 +155,58 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
 
     function syncPending() {
         setPending({ count: dirtyNodesRef.current.size + dirtyEdgesRef.current.size, sending: flushingRef.current, error: pendingErrorRef.current });
+        schedulePersistDraft();
+    }
+
+    // 把当前未确认草稿写入 localforage（按房间+用户）；无草稿时清除。
+    // 刷新页面后据此恢复待发送目标并补发，提交成功后自动清除。
+    function persistDraft() {
+        const activeUserId = userIdRef.current;
+        const activeRoomId = roomIdRef.current;
+        if (!activeUserId || !activeRoomId) return;
+        if (!hasDirty()) {
+            void clearRoomDraft(activeUserId, activeRoomId);
+            return;
+        }
+        const draftNodes = nodesRef.current.filter((node) => dirtyNodesRef.current.has(node.id) && !deletedNodesRef.current.has(node.id));
+        const draftEdges = connectionsRef.current.filter((edge) => dirtyEdgesRef.current.has(edge.id) && !deletedEdgesRef.current.has(edge.id));
+        const nodeVersions: Record<string, number> = {};
+        dirtyNodesRef.current.forEach((id) => {
+            const version = nodeVersionsRef.current.get(id);
+            if (version !== undefined) nodeVersions[id] = version;
+        });
+        const edgeVersions: Record<string, number> = {};
+        dirtyEdgesRef.current.forEach((id) => {
+            const version = edgeVersionsRef.current.get(id);
+            if (version !== undefined) edgeVersions[id] = version;
+        });
+        void saveRoomDraft({
+            userId: activeUserId,
+            roomId: activeRoomId,
+            savedAt: Date.now(),
+            revision: revisionRef.current,
+            nodes: draftNodes,
+            edges: draftEdges,
+            deletedNodeIds: [...deletedNodesRef.current],
+            deletedEdgeIds: [...deletedEdgesRef.current],
+            nodeVersions,
+            edgeVersions,
+            operationId: attemptRef.current?.operationId,
+            signature: attemptRef.current?.signature,
+        });
+    }
+
+    function schedulePersistDraft() {
+        if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = setTimeout(() => {
+            persistTimerRef.current = null;
+            persistDraft();
+        }, DRAFT_PERSIST_DEBOUNCE_MS);
+    }
+
+    function clearConflict() {
+        conflictRef.current = null;
+        setConflict(null);
     }
 
     function bumpRev(id: string) {
@@ -261,6 +390,9 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         dirtyNodesRef.current.forEach((id) => targets.push({ kind: "node", id }));
         dirtyEdgesRef.current.forEach((id) => targets.push({ kind: "edge", id }));
         if (!targets.length) return;
+        // 目标顺序固定（节点在前、各自按 id 排序），使同一批内容的 operationId 签名在刷新恢复后仍一致，
+        // 从而命中服务端幂等回执，避免重发产生重复节点。
+        targets.sort((a, b) => (a.kind === b.kind ? a.id.localeCompare(b.id) : a.kind === "node" ? -1 : 1));
 
         const operations: CollabOperation[] = [];
         const sent: { target: Target; rev: number }[] = [];
@@ -317,6 +449,8 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         const signature = JSON.stringify(operations);
         const operationId = attemptRef.current && attemptRef.current.signature === signature ? attemptRef.current.operationId : newOperationId();
         attemptRef.current = { operationId, signature };
+        // 立即持久化本次提交的幂等键：刷新页面后重发仍可命中同一回执。
+        persistDraft();
         submitCollabOperations(activeRoomId, buildOperationEnvelope(activeRoomId, operationId, operations))
             .then((result) => {
                 if (destroyedRef.current) return;
@@ -335,6 +469,9 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
                 if (destroyedRef.current) return;
                 // 失败保留草稿：不回滚本地状态、不清待发送标记，等待重试或新的编辑。
                 pendingErrorRef.current = toPendingError(error);
+                const nextConflict = toConflict(error, nodesRef.current);
+                conflictRef.current = nextConflict;
+                setConflict(nextConflict);
                 suspendedRef.current = true;
             })
             .finally(() => {
@@ -343,6 +480,122 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
                 syncPending();
                 if (!suspendedRef.current && hasDirty()) scheduleFlush(0);
             });
+    }
+
+    // 用服务端最新版本：丢弃该目标本地草稿，采用服务端内容（其余草稿继续提交）。
+    function resolveConflictUseServer() {
+        const active = conflictRef.current;
+        if (!active) return;
+        if (active.targetKind === "node") {
+            dirtyNodesRef.current.delete(active.targetId);
+            deletedNodesRef.current.delete(active.targetId);
+            localRevRef.current.delete(active.targetId);
+            let next = nodesRef.current;
+            if (active.serverNode) {
+                const server = active.serverNode;
+                if (active.serverVersion !== null) nodeVersionsRef.current.set(server.id, active.serverVersion);
+                const index = next.findIndex((node) => node.id === server.id);
+                if (index === -1) next = [...next, server];
+                else {
+                    next = next.slice();
+                    next[index] = server;
+                }
+            } else {
+                // 服务端已删除或不再返回该节点：移除本地草稿及其连线。
+                nodeVersionsRef.current.delete(active.targetId);
+                if (next.some((node) => node.id === active.targetId)) next = next.filter((node) => node.id !== active.targetId);
+                const remaining = connectionsRef.current.filter((edge) => edge.fromNodeId !== active.targetId && edge.toNodeId !== active.targetId);
+                if (remaining.length !== connectionsRef.current.length) commitConnections(remaining);
+            }
+            commitNodes(next);
+        } else {
+            dirtyEdgesRef.current.delete(active.targetId);
+            deletedEdgesRef.current.delete(active.targetId);
+            localRevRef.current.delete(active.targetId);
+            edgeVersionsRef.current.delete(active.targetId);
+            // 连线的服务端端点无法从冲突 details 还原，重新拉取快照对齐（草稿目标仍保留）。
+            void refreshGraph();
+        }
+        clearConflict();
+        pendingErrorRef.current = null;
+        suspendedRef.current = false;
+        syncPending();
+        flushNow();
+    }
+
+    // 保留本地草稿并重试：以服务端最新版本作为期望版本重发（用户明确选择保留自己的编辑）。
+    // 服务端目标已删除时不能覆盖，改为以新 ID 保留为副本，绝不静默丢弃输入。
+    function resolveConflictKeepLocal() {
+        const active = conflictRef.current;
+        if (!active) return;
+        if (active.targetKind === "node") {
+            if (deletedNodesRef.current.has(active.targetId)) {
+                // 本地草稿就是删除：服务端已删除，直接丢弃该草稿。
+                dirtyNodesRef.current.delete(active.targetId);
+            } else if (active.serverVersion !== null) {
+                nodeVersionsRef.current.set(active.targetId, active.serverVersion);
+                dirtyNodesRef.current.add(active.targetId);
+            } else {
+                keepNodeAsCopy(active);
+            }
+        } else if (active.serverVersion !== null && !deletedEdgesRef.current.has(active.targetId)) {
+            edgeVersionsRef.current.set(active.targetId, active.serverVersion);
+            dirtyEdgesRef.current.add(active.targetId);
+        } else {
+            // 连线已被服务端删除：以新 ID 重新连接，保留本地意图。
+            const edge = connectionsRef.current.find((item) => item.id === active.targetId);
+            dirtyEdgesRef.current.delete(active.targetId);
+            deletedEdgesRef.current.delete(active.targetId);
+            localRevRef.current.delete(active.targetId);
+            edgeVersionsRef.current.delete(active.targetId);
+            if (edge) {
+                const copy: CanvasConnection = { ...edge, id: newEdgeId() };
+                commitConnections([...connectionsRef.current.filter((item) => item.id !== active.targetId), copy]);
+                dirtyEdgesRef.current.add(copy.id);
+            }
+        }
+        clearConflict();
+        pendingErrorRef.current = null;
+        suspendedRef.current = false;
+        syncPending();
+        flushNow();
+    }
+
+    // 服务端已删除该节点：把本地草稿保留为新节点（新 ID 重新创建）。
+    function keepNodeAsCopy(active: CollabConflict) {
+        const local = nodesRef.current.find((node) => node.id === active.targetId) || active.localNode;
+        dirtyNodesRef.current.delete(active.targetId);
+        deletedNodesRef.current.delete(active.targetId);
+        localRevRef.current.delete(active.targetId);
+        nodeVersionsRef.current.delete(active.targetId);
+        if (!local) return;
+        const copy: CanvasNodeData = { ...local, id: newNodeId(), position: { ...local.position }, metadata: { ...local.metadata } };
+        commitNodes([...nodesRef.current.filter((node) => node.id !== active.targetId), copy]);
+        dirtyNodesRef.current.add(copy.id);
+    }
+
+    // 把提交回执 / 撤销重做回执的 changes 应用到本地共享图（复用远端合并逻辑，按版本去重）。
+    function applyServerChanges(changes: CollabRoomChange[]) {
+        const views = changes.map(collabRoomChangeToView).filter((view): view is CollabChangeView => view !== null);
+        if (views.length) applyRemoteChanges(views);
+    }
+
+    // 重新拉取服务端公共图并按快照重建本地图（未确认草稿优先保留），用于丢弃某个冲突目标后对齐服务端。
+    async function refreshGraph() {
+        const activeRoomId = roomIdRef.current;
+        if (!activeRoomId) return;
+        try {
+            const graph = await fetchCollabRoomGraph(activeRoomId);
+            if (destroyedRef.current) return;
+            const nodes = graph.nodes.map((node) => collabRoomChangeToView({ type: "upsert", node })?.node).filter((node): node is CollabNodeView => !!node);
+            applyRemoteSnapshot({
+                revision: graph.revision,
+                nodes,
+                edges: graph.edges.map((edge) => ({ id: edge.id, fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId, version: edge.version })),
+            });
+        } catch {
+            // 刷新失败时保留本地状态，草稿不丢。
+        }
     }
 
     useEffect(() => {
@@ -361,28 +614,78 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         deletedEdgesRef.current = new Set();
         localRevRef.current = new Map();
         pendingErrorRef.current = null;
+        conflictRef.current = null;
         suspendedRef.current = false;
         attemptRef.current = null;
         setNodes([]);
         setConnections([]);
         setPending({ count: 0, sending: false, error: null });
+        setConflict(null);
 
         Promise.all([fetchCollabRoom(roomId), fetchCollabRoomGraph(roomId)])
-            .then(([detail, graph]) => {
+            .then(async ([detail, graph]) => {
                 if (cancelled) return;
                 const mapped = roomGraphToCanvas(graph);
-                nodesRef.current = mapped.nodes;
-                connectionsRef.current = mapped.connections;
                 const nodeVersions = new Map<string, number>();
                 graph.nodes.forEach((node) => nodeVersions.set(node.id, node.version));
-                nodeVersionsRef.current = nodeVersions;
                 const edgeVersions = new Map<string, number>();
                 graph.edges.forEach((edge) => edgeVersions.set(edge.id, edge.version));
+
+                // 恢复刷新前未确认草稿：本地草稿优先于服务端内容，并重新标记待发送（#15 草稿保留）。
+                const draft = await loadRoomDraft(userIdRef.current, roomId);
+                if (cancelled) return;
+                let restoredNodes = mapped.nodes;
+                let restoredConnections = mapped.connections;
+                if (draft) {
+                    const draftNodes = new Map(draft.nodes.map((node) => [node.id, node]));
+                    const deletedNodes = new Set(draft.deletedNodeIds);
+                    restoredNodes = mapped.nodes.filter((node) => !deletedNodes.has(node.id)).map((node) => draftNodes.get(node.id) ?? node);
+                    draftNodes.forEach((node, id) => {
+                        if (!restoredNodes.some((item) => item.id === id)) restoredNodes.push(node);
+                    });
+
+                    const nodeIds = new Set(restoredNodes.map((node) => node.id));
+                    const draftEdges = new Map(draft.edges.map((edge) => [edge.id, edge]));
+                    const deletedEdges = new Set(draft.deletedEdgeIds);
+                    restoredConnections = mapped.connections.filter((edge) => !deletedEdges.has(edge.id) && nodeIds.has(edge.fromNodeId) && nodeIds.has(edge.toNodeId)).map((edge) => draftEdges.get(edge.id) ?? edge);
+                    draftEdges.forEach((edge, id) => {
+                        if (nodeIds.has(edge.fromNodeId) && nodeIds.has(edge.toNodeId) && !restoredConnections.some((item) => item.id === id)) restoredConnections.push(edge);
+                    });
+
+                    // 草稿目标采用草稿已知版本；服务端无版本的新建目标保持无版本（create 语义）。
+                    Object.entries(draft.nodeVersions).forEach(([id, version]) => nodeVersions.set(id, version));
+                    Object.entries(draft.edgeVersions).forEach(([id, version]) => edgeVersions.set(id, version));
+                    draft.nodes.forEach((node) => {
+                        if (draft.nodeVersions[node.id] === undefined) nodeVersions.delete(node.id);
+                    });
+                    draft.edges.forEach((edge) => {
+                        if (draft.edgeVersions[edge.id] === undefined) edgeVersions.delete(edge.id);
+                    });
+                    draft.deletedNodeIds.forEach((id) => {
+                        if (draft.nodeVersions[id] === undefined) nodeVersions.delete(id);
+                        deletedNodesRef.current.add(id);
+                        dirtyNodesRef.current.add(id);
+                    });
+                    draft.deletedEdgeIds.forEach((id) => {
+                        if (draft.edgeVersions[id] === undefined) edgeVersions.delete(id);
+                        deletedEdgesRef.current.add(id);
+                        dirtyEdgesRef.current.add(id);
+                    });
+                    draftNodes.forEach((_node, id) => dirtyNodesRef.current.add(id));
+                    draftEdges.forEach((_edge, id) => dirtyEdgesRef.current.add(id));
+                    if (draft.operationId && draft.signature) attemptRef.current = { operationId: draft.operationId, signature: draft.signature };
+                }
+
+                nodesRef.current = restoredNodes;
+                connectionsRef.current = restoredConnections;
+                nodeVersionsRef.current = nodeVersions;
                 edgeVersionsRef.current = edgeVersions;
                 setRoom(detail);
-                setNodes(mapped.nodes);
-                setConnections(mapped.connections);
+                setNodes(restoredNodes);
+                setConnections(restoredConnections);
                 setRevision(graph.revision);
+                syncPending();
+                if (hasDirty()) scheduleFlush(0);
             })
             .catch((err: unknown) => {
                 if (!cancelled) setLoadError(err instanceof Error ? err.message : "加载共享画布失败");
@@ -395,6 +698,9 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
             cancelled = true;
             destroyedRef.current = true;
             if (timerRef.current) clearTimeout(timerRef.current);
+            if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+            // 离开/刷新前落盘一次未确认草稿（正常情况下防抖已写入，此处兜底）。
+            persistDraft();
         };
     }, [enabled, roomId, token]);
 
@@ -514,6 +820,7 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
     function retryPending() {
         suspendedRef.current = false;
         pendingErrorRef.current = null;
+        clearConflict();
         syncPending();
         flushNow();
     }
@@ -528,6 +835,7 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         loading,
         loadError,
         pending,
+        conflict,
         canEdit,
         createTextNode,
         moveNode,
@@ -539,6 +847,10 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         disconnectEdge,
         flushNow,
         retryPending,
+        resolveConflictUseServer,
+        resolveConflictKeepLocal,
+        applyServerChanges,
+        refreshGraph,
         applyRemoteChanges,
         applyRemoteSnapshot,
     };
