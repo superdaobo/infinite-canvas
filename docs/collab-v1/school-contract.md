@@ -36,8 +36,14 @@
 - 设备能力边界（安全边界 §3.2/§3.3，本期为契约，由 #19 落地）：
   - 设备**只能**访问受限任务 API（心跳 / 领取 / 续租 / 回传），**禁止**访问 `/api/v1/*`、`/api/admin/*`、房间列表、成员列表、他人画布、模型密钥。
   - 设备只能拿到服务端**已分配给它**的最小任务载荷（工作流、参考图短时 URL、输出目标节点 ID），**不得列举他人画布或密钥**。
-  - 设备归属绑定 `(OwnerScope, OwnerID)`，学校设备应为受控的系统级归属（安全边界 R4，具体取值待 #19 决策）。
+  - 设备归属绑定 `(OwnerScope, OwnerID)`，学校设备固定为受控的系统级归属 `(system, school)`（C03-03 已落地，安全边界 R4）。
 - 执行器与 mock 学校服务之间的接口见第 6 节。
+
+### 2.1 设备身份与学校账号绑定（C03-03 / #19 落地）
+
+- **设备注册/轮换/吊销**：设备记录存于 `school_devices`，服务端只保存令牌的 SHA-256（`model.SchoolDevice.TokenHash`，响应/日志绝不回显）。注册需配置 `SCHOOL_DEVICE_REGISTRATION_SECRET`，未配置时注册关闭；令牌轮换后旧令牌立即失效；吊销（`Enabled=false`）后认证立即失败。服务入口：`service.RegisterSchoolDevice` / `RotateSchoolDeviceToken` / `RevokeSchoolDevice`。
+- **认证回退**：默认认证先查数据库设备记录，未命中再回退到配置静态令牌（部署期 bootstrap 通道）；两者都失败返回 `ErrSchoolExecutorUnauthorized`（401）。设备令牌与用户 JWT 完全分离。
+- **学校账号绑定**：设备记录携带学校账号**不可逆指纹** `SchoolAccountRef`（绝不含 Cookie/登录态）。设备领取任务时把该指纹写入任务的 `school_account_ref`；设备上报的账号指纹变化（心跳）即视为账号切换。**账号变化时旧任务不得在新账号下重新提交**：绑定上游（重新提交）与恢复（re-bind）都校验账号一致，不一致返回 `school_account_changed`（409），任务保持 `running`、单执行槽不释放、绝不重复生成；设备可显式把旧任务置为 `failed` 结束，但绝不静默改账号重放。
 
 ## 3. 任务幂等
 
@@ -146,9 +152,10 @@ type SchoolUpstreamClient interface {
 
 ## 9. 开放点与未解决风险
 
-- **O1**：学校设备的具体 `OwnerScope` 取值（受控系统级归属的枚举值）待 #19 决策（安全边界 R4）。
-- **O2**：设备令牌的签发/轮换/吊销流程待 #19/#28 落地，本契约只引用现有 Comfy Bridge 先例。
+- **O1（已闭环）**：学校设备归属固定为受控系统级 `(system, school)`，由 C03-03 / #19 落地（`model.SchoolDeviceOwnerScopeSystem`）。
+- **O2（已闭环，mock）**：设备令牌的签发/轮换/吊销由 C03-03 / #19 以「配置化注册密钥 + `school_devices` 记录」实现，明文仅注册/轮换时返回一次；真实凭据与生产签发流程仍待单独授权。
 - **O3**：`school_` 表结构与索引（唯一键 `(roomId, submittedBy, clientTaskId)`）待 #18 落地；本契约不新增表。
 - **O4**：H3 工作流字段的别名/单字段兼容细节（`ref_image` 别名场景）待 #21 对齐。
+- **O5（新增）**：设备管理入口当前只提供受控 service 调用，尚无管理员 HTTP 路由；上线前需补管理员鉴权的设备管理接口。
 - **R1**：真实学校工作流与凭据不在本仓库、不在本任务范围内；任何真实设备/凭据操作需单独授权。
 - **R2**：mock 上游接口为定义层，尚无生产实现；#18/#22 需用假数据实现并补集成测试。

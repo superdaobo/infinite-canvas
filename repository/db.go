@@ -94,6 +94,7 @@ func DB() (*gorm.DB, error) {
 			&model.RoomHistory{},
 			&model.RoomMedia{},
 			&model.SchoolTaskRecord{},
+			&model.SchoolDevice{},
 		)
 	})
 	return db, dbErr

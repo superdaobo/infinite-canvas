@@ -158,13 +158,20 @@ func CountQueuedSchoolTasksByUser(roomID, submittedBy string) (int64, error) {
 // 仅当没有 running 任务时才领取，按 created_at/id FIFO 取最早的一条。
 // 返回 ok=false 表示当前无可领取任务（队列空或单执行槽已被占用）。
 func ClaimNextQueuedSchoolTask(executorID string) (model.SchoolTask, bool, error) {
+	return ClaimNextQueuedSchoolTaskForAccount(executorID, "")
+}
+
+// ClaimNextQueuedSchoolTaskForAccount 与 ClaimNextQueuedSchoolTask 相同，但额外把
+// 执行设备当前的学校账号指纹绑定写入任务（C03-03 / #19 账号绑定）。accountRef 为空
+// 表示不绑定账号，沿用旧语义。
+func ClaimNextQueuedSchoolTaskForAccount(executorID, accountRef string) (model.SchoolTask, bool, error) {
 	executorID = strings.TrimSpace(executorID)
 	if executorID == "" {
 		return model.SchoolTask{}, false, errors.New("执行设备 ID 不能为空")
 	}
 	// 并发下 SQLite 可能返回 SQLITE_BUSY；重试后即可观察到已提交的 running 任务。
 	for attempt := 0; attempt < 5; attempt++ {
-		task, ok, err := claimQueuedSchoolTaskOnce(executorID)
+		task, ok, err := claimQueuedSchoolTaskOnce(executorID, strings.TrimSpace(accountRef))
 		if err == nil {
 			return task, ok, nil
 		}
@@ -176,7 +183,7 @@ func ClaimNextQueuedSchoolTask(executorID string) (model.SchoolTask, bool, error
 	return model.SchoolTask{}, false, nil
 }
 
-func claimQueuedSchoolTaskOnce(executorID string) (model.SchoolTask, bool, error) {
+func claimQueuedSchoolTaskOnce(executorID, accountRef string) (model.SchoolTask, bool, error) {
 	db, err := DB()
 	if err != nil {
 		return model.SchoolTask{}, false, err
@@ -206,11 +213,12 @@ func claimQueuedSchoolTaskOnce(executorID string) (model.SchoolTask, bool, error
 		result := tx.Model(&model.SchoolTaskRecord{}).
 			Where("id = ? AND status = ?", record.ID, model.SchoolTaskQueued).
 			Updates(map[string]any{
-				"status":       string(model.SchoolTaskRunning),
-				"executor_id":  executorID,
-				"running_slot": slot,
-				"last_seen_at": now,
-				"updated_at":   now,
+				"status":             string(model.SchoolTaskRunning),
+				"executor_id":        executorID,
+				"school_account_ref": accountRef,
+				"running_slot":       slot,
+				"last_seen_at":       now,
+				"updated_at":         now,
 			})
 		if result.Error != nil {
 			// running_slot 唯一索引被并发事务抢占：本次没有领到任务。
@@ -224,6 +232,7 @@ func claimQueuedSchoolTaskOnce(executorID string) (model.SchoolTask, bool, error
 		}
 		record.Status = string(model.SchoolTaskRunning)
 		record.ExecutorID = executorID
+		record.SchoolAccountRef = accountRef
 		record.RunningSlot = &slot
 		record.LastSeenAt = &now
 		record.UpdatedAt = now
@@ -232,6 +241,26 @@ func claimQueuedSchoolTaskOnce(executorID string) (model.SchoolTask, bool, error
 		return nil
 	})
 	return claimed, ok, err
+}
+
+// ListSchoolTasksByExecutor 返回该执行设备领取过的任务，按创建顺序升序。
+// 设备侧只能看到绑定到自己的任务，绝不返回其他设备或房间的任务。
+func ListSchoolTasksByExecutor(executorID string) ([]model.SchoolTask, error) {
+	db, err := DB()
+	if err != nil {
+		return nil, err
+	}
+	var records []model.SchoolTaskRecord
+	if err := db.Where("executor_id = ?", strings.TrimSpace(executorID)).
+		Order("created_at ASC, id ASC").
+		Find(&records).Error; err != nil {
+		return nil, err
+	}
+	tasks := make([]model.SchoolTask, 0, len(records))
+	for _, record := range records {
+		tasks = append(tasks, record.ToSchoolTask())
+	}
+	return tasks, nil
 }
 
 // CancelQueuedSchoolTask 取消本人提交的 queued 任务；返回是否命中记录。

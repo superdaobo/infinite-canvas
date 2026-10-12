@@ -20,7 +20,7 @@ func BridgeSchoolClaim(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	claim, err := service.ClaimSchoolTask(r.Context(), executor.ID)
+	claim, err := service.ClaimSchoolTaskForDevice(r.Context(), executor)
 	if err != nil {
 		writeCollabSchoolError(w, err)
 		return
@@ -42,12 +42,48 @@ func BridgeSchoolUpdate(w http.ResponseWriter, r *http.Request) {
 		writeCollabSchoolError(w, errInvalidJSON())
 		return
 	}
-	task, err := service.BindSchoolTaskUpstreamForExecutor(r.Context(), executor.ID, request.TaskID, request.UpstreamTaskID)
+	task, err := service.BindSchoolTaskUpstreamForDevice(r.Context(), executor, request.TaskID, request.UpstreamTaskID)
 	if err != nil {
 		writeCollabSchoolError(w, err)
 		return
 	}
 	OK(w, task.DeviceView())
+}
+
+// BridgeSchoolHeartbeat 设备心跳：上报当前学校账号指纹并刷新在线时间；
+// 若设备持有的 running 任务绑定的是旧账号，返回 accountMismatch=true。
+func BridgeSchoolHeartbeat(w http.ResponseWriter, r *http.Request) {
+	executor, ok := authenticateSchoolExecutor(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		SchoolAccountRef string `json:"schoolAccountRef"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&request)
+	}
+	heartbeat, err := service.HeartbeatSchoolExecutor(r.Context(), executor, request.SchoolAccountRef)
+	if err != nil {
+		writeCollabSchoolError(w, err)
+		return
+	}
+	OK(w, heartbeat)
+}
+
+// BridgeSchoolTasks 设备列举自己领取过的任务（最小设备载荷）。
+// 只返回绑定到该设备的任务，不返回他人任务、房间列表或任何学校凭据。
+func BridgeSchoolTasks(w http.ResponseWriter, r *http.Request) {
+	executor, ok := authenticateSchoolExecutor(w, r)
+	if !ok {
+		return
+	}
+	tasks, err := service.ListExecutorSchoolTasks(r.Context(), executor.ID)
+	if err != nil {
+		writeCollabSchoolError(w, err)
+		return
+	}
+	OK(w, map[string]any{"items": tasks})
 }
 
 // BridgeSchoolFinish 结束自己持有的 running 任务：失败按脱敏原因记录；
@@ -146,7 +182,7 @@ func BridgeSchoolRecover(w http.ResponseWriter, r *http.Request) {
 		writeCollabSchoolError(w, errInvalidJSON())
 		return
 	}
-	task, err := service.RecoverRunningSchoolTask(r.Context(), executor.ID, request.TaskID,
+	task, err := service.RecoverRunningSchoolTaskForDevice(r.Context(), executor, request.TaskID,
 		request.Note, request.ConfirmPreviousStopped)
 	if err != nil {
 		writeCollabSchoolError(w, err)

@@ -141,12 +141,19 @@ func CancelSchoolTask(ctx context.Context, roomID, taskID string) (model.SchoolT
 
 // ClaimSchoolTask 设备领取下一个 queued 任务（FIFO 单执行槽）。Blocked=true 表示
 // 单执行槽被一个 running 任务占用；此时设备应等待或走恢复流程，不得重复提交。
+// 保留按 executorID 的旧入口，不绑定学校账号（兼容 #18 调用方）。
 func ClaimSchoolTask(ctx context.Context, executorID string) (model.SchoolTaskClaim, error) {
-	executorID = strings.TrimSpace(executorID)
+	return ClaimSchoolTaskForDevice(ctx, SchoolExecutor{ID: executorID})
+}
+
+// ClaimSchoolTaskForDevice 受限设备领取任务：把设备当前的学校账号指纹绑定写入任务，
+// 后续重新提交（绑定上游/恢复）都要求账号一致（C03-03 / #19）。
+func ClaimSchoolTaskForDevice(ctx context.Context, executor SchoolExecutor) (model.SchoolTaskClaim, error) {
+	executorID := strings.TrimSpace(executor.ID)
 	if executorID == "" {
 		return model.SchoolTaskClaim{}, contractFailure(CodeSchoolExecutorUnauthorized, "执行设备身份无效", nil)
 	}
-	task, ok, err := repository.ClaimNextQueuedSchoolTask(executorID)
+	task, ok, err := repository.ClaimNextQueuedSchoolTaskForAccount(executorID, strings.TrimSpace(executor.SchoolAccountRef))
 	if err != nil {
 		return model.SchoolTaskClaim{}, err
 	}
@@ -171,13 +178,33 @@ func BindSchoolTaskUpstreamForExecutor(ctx context.Context, executorID, taskID, 
 	if err != nil {
 		return model.SchoolTask{}, err
 	}
+	return bindSchoolTaskUpstream(executorID, task, upstreamTaskID)
+}
+
+// BindSchoolTaskUpstreamForDevice 在回传上游任务号（即向学校重新提交）前校验学校账号绑定：
+// 设备当前账号与任务绑定账号不一致时返回 school_account_changed，任务保持 running、
+// 单执行槽不释放、绝不重复提交。
+func BindSchoolTaskUpstreamForDevice(ctx context.Context, executor SchoolExecutor, taskID, upstreamTaskID string) (model.SchoolTask, error) {
+	task, err := requireRunningSchoolTask(executor.ID, taskID)
+	if err != nil {
+		return model.SchoolTask{}, err
+	}
+	if model.SchoolAccountMismatch(task.SchoolAccountRef, executor.SchoolAccountRef) {
+		return model.SchoolTask{}, contractFailure(CodeSchoolAccountChanged,
+			"学校账号已变更，旧任务不能在新账号下重新提交", map[string]any{"taskId": task.ID})
+	}
+	return bindSchoolTaskUpstream(executor.ID, task, upstreamTaskID)
+}
+
+// bindSchoolTaskUpstream 是绑定上游任务号的共用实现：首次写入、重复同号幂等、异号冲突。
+func bindSchoolTaskUpstream(executorID string, task model.SchoolTask, upstreamTaskID string) (model.SchoolTask, error) {
 	if err := BindSchoolTaskUpstream(&task, upstreamTaskID); err != nil {
 		return model.SchoolTask{}, err
 	}
-	if _, err := repository.SetSchoolTaskUpstream(taskID, task.UpstreamTaskID); err != nil {
+	if _, err := repository.SetSchoolTaskUpstream(task.ID, task.UpstreamTaskID); err != nil {
 		return model.SchoolTask{}, err
 	}
-	_, _ = repository.TouchRunningSchoolTask(taskID, executorID)
+	_, _ = repository.TouchRunningSchoolTask(task.ID, executorID)
 	return task, nil
 }
 
@@ -216,8 +243,19 @@ func FinishSchoolTaskForExecutor(ctx context.Context, executorID, taskID string,
 
 // RecoverRunningSchoolTask 把 running 任务重新绑定到当前执行设备，保留原
 // upstream_task_id 与 running 状态（服务重启/设备中断后不重复生成）。note 作为
-// 可审计说明写入任务记录。
+// 可审计说明写入任务记录。保留按 executorID 的旧入口，不校验学校账号绑定。
 func RecoverRunningSchoolTask(ctx context.Context, executorID, taskID, note string, confirmPreviousStopped bool) (model.SchoolTask, error) {
+	return recoverRunningSchoolTask(executorID, "", taskID, note, confirmPreviousStopped)
+}
+
+// RecoverRunningSchoolTaskForDevice 与 RecoverRunningSchoolTask 相同，但额外校验
+// 学校账号绑定：设备当前账号与任务绑定账号不一致时拒绝恢复（school_account_changed），
+// 任务保持 running、单执行槽不释放、绝不重复提交（C03-03 / #19）。
+func RecoverRunningSchoolTaskForDevice(ctx context.Context, executor SchoolExecutor, taskID, note string, confirmPreviousStopped bool) (model.SchoolTask, error) {
+	return recoverRunningSchoolTask(executor.ID, executor.SchoolAccountRef, taskID, note, confirmPreviousStopped)
+}
+
+func recoverRunningSchoolTask(executorID, accountRef, taskID, note string, confirmPreviousStopped bool) (model.SchoolTask, error) {
 	executorID = strings.TrimSpace(executorID)
 	if executorID == "" {
 		return model.SchoolTask{}, contractFailure(CodeSchoolExecutorUnauthorized, "执行设备身份无效", nil)
@@ -234,6 +272,10 @@ func RecoverRunningSchoolTask(ctx context.Context, executorID, taskID, note stri
 	}
 	if task.Status != model.SchoolTaskRunning {
 		return model.SchoolTask{}, contractFailure(CodeSchoolTaskNotRunning, "没有可恢复的执行中任务", map[string]any{"status": task.Status})
+	}
+	if model.SchoolAccountMismatch(task.SchoolAccountRef, accountRef) {
+		return model.SchoolTask{}, contractFailure(CodeSchoolAccountChanged,
+			"学校账号已变更，不能在新账号下恢复旧任务", map[string]any{"taskId": task.ID})
 	}
 	if strings.TrimSpace(note) == "" {
 		note = "执行器已重新绑定，等待恢复原学校任务"

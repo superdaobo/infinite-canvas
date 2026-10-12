@@ -224,8 +224,10 @@ func New() *gin.Engine {
 	bridge.GET("/poll", gin.WrapF(handler.BridgeComfyPoll))
 	bridge.POST("/lease", gin.WrapF(handler.BridgeComfyLease))
 	bridge.POST("/result", gin.WrapF(handler.BridgeComfyResult))
-	// 学校受限执行设备接口（C03-02）：独立分组、Bearer 设备令牌，与用户 JWT 分离。
+	// 学校受限执行设备接口（C03-02 / C03-03）：独立分组、Bearer 设备令牌，与用户 JWT 分离。
 	schoolBridge := api.Group("/bridge/school")
+	schoolBridge.POST("/heartbeat", gin.WrapF(handler.BridgeSchoolHeartbeat))
+	schoolBridge.GET("/tasks", gin.WrapF(handler.BridgeSchoolTasks))
 	schoolBridge.POST("/claim", gin.WrapF(handler.BridgeSchoolClaim))
 	schoolBridge.POST("/update", gin.WrapF(handler.BridgeSchoolUpdate))
 	schoolBridge.POST("/finish", gin.WrapF(handler.BridgeSchoolFinish))
