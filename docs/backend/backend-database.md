@@ -45,6 +45,7 @@ description: 当前后端主要数据表与字段说明
 - `collab_room_history`
 - `collab_room_media`
 - `school_tasks`
+- `school_devices`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -536,6 +537,7 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 | `client_task_id` | string | 提交端生成的幂等键 |
 | `executor_id` | string | 受限执行设备身份；未领取时为空 |
 | `upstream_task_id` | string | 上游学校任务号，首次绑定后不可替换 |
+| `school_account_ref` | string | 执行该任务的学校账号**不可逆指纹**（领取时由设备身份绑定）；账号变化阻止旧任务重提交，绝不存 Cookie/登录态 |
 | `channel` | string | 学校渠道：`qwen`（文生图）、`h3`（1–9 参考图视频） |
 | `status` | string | 状态机：`queued`、`running`、`succeeded`、`failed`、`cancelled` |
 | `params_json` | text | 生成参数 JSON（prompt、有序参考图、秒数等） |
@@ -551,6 +553,30 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 - `idx_school_tasks_queue (status, created_at)`：队列按 `created_at, id` 升序 FIFO 领取。
 
 领取走单事务：先确认没有 running，再取最早的 queued 任务并置为 running；并发事务由 `running_slot` 唯一索引兜底，不会双领。服务重启或设备中断后 running 任务**保持 running**、保留 `upstream_task_id` 与设备绑定，绝不自动改回 queued，也不重复生成；恢复由设备显式调用 `/api/bridge/school/recover` 完成（写 `error` 作为审计说明）。
+
+
+### school_devices
+
+学校受限执行设备身份表（协作 v1，C03-03）。设备令牌与用户 JWT 完全分离，服务端只保存令牌摘要；设备是受控的系统级归属（`owner_scope=system`），不允许任意用户注册为学校设备。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键，由令牌摘要确定性派生（`sdev_` 前缀） |
+| `name` | string | 设备可读名（运维识别用） |
+| `token_hash` | string | 设备令牌的 SHA-256 十六进制摘要；**绝不保存令牌明文** |
+| `owner_scope` | string | 归属范围，学校设备固定为 `system` |
+| `owner_id` | string | 归属 ID，学校设备固定为 `school` |
+| `school_account_ref` | string | 设备侧学校账号**不可逆指纹**；为空表示未绑定，绝不存 Cookie/登录态 |
+| `enabled` | bool | `false` 表示令牌已吊销，认证立即失败 |
+| `last_seen_at` | datetime | 设备最近心跳时间 |
+| `rotated_at` | datetime | 最近一次令牌轮换时间 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引与约束：
+
+- `idx_school_devices_token (token_hash)` 唯一索引：令牌摘要唯一，认证按摘要精确查找。
+- 设备管理（注册/轮换/吊销）只提供受控的 service 入口，注册需配置 `SCHOOL_DEVICE_REGISTRATION_SECRET`；未配置时注册关闭。
+- 设备令牌与用户 JWT 分离，设备只允许访问 `/api/bridge/school/*` 受限任务接口，不能列举他人画布、房间或密钥。
 
 
 ### settings

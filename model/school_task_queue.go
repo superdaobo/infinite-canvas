@@ -27,10 +27,12 @@ type SchoolTaskRecord struct {
 	ExecutorID string `gorm:"size:64"`
 	// 上游学校任务号；一旦绑定不可替换。
 	UpstreamTaskID string `gorm:"size:128"`
-	Channel        string `gorm:"size:16"`
-	Status         string `gorm:"size:16;index:idx_school_tasks_queue,priority:1"`
-	ParamsJSON     string `gorm:"type:text"`
-	Error          string `gorm:"type:text"`
+	// 执行该任务的学校账号不可逆指纹；领取时绑定，账号变化阻止旧任务重提交。
+	SchoolAccountRef string `gorm:"size:128"`
+	Channel          string `gorm:"size:16"`
+	Status           string `gorm:"size:16;index:idx_school_tasks_queue,priority:1"`
+	ParamsJSON       string `gorm:"type:text"`
+	Error            string `gorm:"type:text"`
 	// RunningSlot 仅在任务处于 running 时为非 NULL（值为 SchoolTaskRunningSlot）。
 	// 唯一索引由此保证全局单执行槽。
 	RunningSlot *int       `gorm:"uniqueIndex:idx_school_tasks_one_running"`
@@ -46,19 +48,20 @@ func (SchoolTaskRecord) TableName() string { return "school_tasks" }
 func NewSchoolTaskRecord(task SchoolTask) SchoolTaskRecord {
 	paramsJSON, _ := json.Marshal(task.Params)
 	record := SchoolTaskRecord{
-		ID:             task.ID,
-		RoomID:         task.RoomID,
-		SubmittedBy:    task.SubmittedBy,
-		ClientTaskID:   task.ClientTaskID,
-		ExecutorID:     task.ExecutorID,
-		UpstreamTaskID: task.UpstreamTaskID,
-		Channel:        string(task.Channel),
-		Status:         string(task.Status),
-		ParamsJSON:     string(paramsJSON),
-		Error:          task.Error,
-		LastSeenAt:     task.LastSeenAt,
-		CreatedAt:      task.CreatedAt,
-		UpdatedAt:      task.UpdatedAt,
+		ID:               task.ID,
+		RoomID:           task.RoomID,
+		SubmittedBy:      task.SubmittedBy,
+		ClientTaskID:     task.ClientTaskID,
+		ExecutorID:       task.ExecutorID,
+		UpstreamTaskID:   task.UpstreamTaskID,
+		SchoolAccountRef: task.SchoolAccountRef,
+		Channel:          string(task.Channel),
+		Status:           string(task.Status),
+		ParamsJSON:       string(paramsJSON),
+		Error:            task.Error,
+		LastSeenAt:       task.LastSeenAt,
+		CreatedAt:        task.CreatedAt,
+		UpdatedAt:        task.UpdatedAt,
 	}
 	if task.Status == SchoolTaskRunning {
 		slot := SchoolTaskRunningSlot
@@ -74,19 +77,20 @@ func (r SchoolTaskRecord) ToSchoolTask() SchoolTask {
 		_ = json.Unmarshal([]byte(r.ParamsJSON), &params)
 	}
 	return SchoolTask{
-		ID:             r.ID,
-		RoomID:         r.RoomID,
-		SubmittedBy:    r.SubmittedBy,
-		ExecutorID:     r.ExecutorID,
-		ClientTaskID:   r.ClientTaskID,
-		UpstreamTaskID: r.UpstreamTaskID,
-		Channel:        SchoolChannel(r.Channel),
-		Status:         SchoolTaskStatus(r.Status),
-		Params:         params,
-		Error:          r.Error,
-		LastSeenAt:     r.LastSeenAt,
-		CreatedAt:      r.CreatedAt,
-		UpdatedAt:      r.UpdatedAt,
+		ID:               r.ID,
+		RoomID:           r.RoomID,
+		SubmittedBy:      r.SubmittedBy,
+		ExecutorID:       r.ExecutorID,
+		ClientTaskID:     r.ClientTaskID,
+		UpstreamTaskID:   r.UpstreamTaskID,
+		SchoolAccountRef: r.SchoolAccountRef,
+		Channel:          SchoolChannel(r.Channel),
+		Status:           SchoolTaskStatus(r.Status),
+		Params:           params,
+		Error:            r.Error,
+		LastSeenAt:       r.LastSeenAt,
+		CreatedAt:        r.CreatedAt,
+		UpdatedAt:        r.UpdatedAt,
 	}
 }
 
@@ -100,25 +104,27 @@ type SchoolTaskQueue struct {
 // SchoolTaskDeviceView 是下发给受限执行设备的最小任务载荷：只含完成该任务所需
 // 的渠道、参数与上游任务号，不含用户凭据、学校 Cookie 或模型密钥。
 type SchoolTaskDeviceView struct {
-	ID             string           `json:"id"`
-	RoomID         string           `json:"roomId"`
-	Channel        SchoolChannel    `json:"channel"`
-	Params         SchoolTaskParams `json:"params"`
-	Status         SchoolTaskStatus `json:"status"`
-	ExecutorID     string           `json:"executorId,omitempty"`
-	UpstreamTaskID string           `json:"upstreamTaskId,omitempty"`
+	ID               string           `json:"id"`
+	RoomID           string           `json:"roomId"`
+	Channel          SchoolChannel    `json:"channel"`
+	Params           SchoolTaskParams `json:"params"`
+	Status           SchoolTaskStatus `json:"status"`
+	ExecutorID       string           `json:"executorId,omitempty"`
+	UpstreamTaskID   string           `json:"upstreamTaskId,omitempty"`
+	SchoolAccountRef string           `json:"schoolAccountRef,omitempty"`
 }
 
 // DeviceView 返回设备侧最小任务载荷。
 func (t SchoolTask) DeviceView() SchoolTaskDeviceView {
 	return SchoolTaskDeviceView{
-		ID:             t.ID,
-		RoomID:         t.RoomID,
-		Channel:        t.Channel,
-		Params:         t.Params,
-		Status:         t.Status,
-		ExecutorID:     t.ExecutorID,
-		UpstreamTaskID: t.UpstreamTaskID,
+		ID:               t.ID,
+		RoomID:           t.RoomID,
+		Channel:          t.Channel,
+		Params:           t.Params,
+		Status:           t.Status,
+		ExecutorID:       t.ExecutorID,
+		UpstreamTaskID:   t.UpstreamTaskID,
+		SchoolAccountRef: t.SchoolAccountRef,
 	}
 }
 

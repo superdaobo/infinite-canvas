@@ -182,16 +182,19 @@ func SchoolTaskID(roomID, submittedBy, clientTaskID string) string {
 // 提交人 SubmittedBy 是真实用户账号（房间成员）；执行人 ExecutorID 是受限设备身份，
 // 与用户 JWT 分离，领取任务时绑定。UpstreamTaskID 一旦绑定不可替换。
 type SchoolTask struct {
-	ID             string           `json:"id"`
-	RoomID         string           `json:"roomId"`
-	SubmittedBy    string           `json:"submittedBy"`
-	ExecutorID     string           `json:"executorId,omitempty"`
-	ClientTaskID   string           `json:"clientTaskId"`
-	UpstreamTaskID string           `json:"upstreamTaskId,omitempty"`
-	Channel        SchoolChannel    `json:"channel"`
-	Status         SchoolTaskStatus `json:"status"`
-	Params         SchoolTaskParams `json:"params"`
-	Error          string           `json:"error,omitempty"`
+	ID             string `json:"id"`
+	RoomID         string `json:"roomId"`
+	SubmittedBy    string `json:"submittedBy"`
+	ExecutorID     string `json:"executorId,omitempty"`
+	ClientTaskID   string `json:"clientTaskId"`
+	UpstreamTaskID string `json:"upstreamTaskId,omitempty"`
+	// SchoolAccountRef 是执行该任务的学校账号不可逆指纹，领取时由执行设备身份绑定。
+	// 账号变化时旧任务不得在新账号下重新提交（C03-03 / #19）；不含任何学校凭据。
+	SchoolAccountRef string           `json:"schoolAccountRef,omitempty"`
+	Channel          SchoolChannel    `json:"channel"`
+	Status           SchoolTaskStatus `json:"status"`
+	Params           SchoolTaskParams `json:"params"`
+	Error            string           `json:"error,omitempty"`
 	// LastSeenAt 是执行设备最近一次心跳/回传时间（#18 持久化引入），
 	// 用于识别设备中断（stale running），不进入对外公开视图。
 	LastSeenAt *time.Time `json:"lastSeenAt,omitempty"`
