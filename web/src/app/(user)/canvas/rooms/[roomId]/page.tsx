@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { AlertTriangle, ChevronLeft, Loader2, MousePointer2, Plus, RefreshCw, Share2, Trash2, Users, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, ChevronLeft, Hand, Loader2, MousePointer2, Plus, RefreshCw, Share2, Trash2, Users, Wifi, WifiOff } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import type { CollabCursorInfo } from "@/services/api/collab-realtime";
@@ -104,6 +104,10 @@ export default function CollabRoomPage() {
     // 邀请链接加入（#16）：读取 fragment 令牌，未登录先登录，登录后自动 accept。
     const { joining, joinError } = useCollabInviteJoin(params.roomId, sharedEnabled);
     const [sharingOpen, setSharingOpen] = useState(false);
+    // 画布工具：默认「选择」，节点可拖动/双击编辑；「移动画布」用于平移视图。
+    // 必须默认 select：pan 工具会在 pointerdown 捕获阶段把指针捕获到画布容器，
+    // 使节点收不到鼠标事件，导致拖动与双击编辑全部失效。
+    const [canvasTool, setCanvasTool] = useState<"select" | "pan">("select");
     const containerRef = useRef<HTMLDivElement>(null);
     const didCenterRef = useRef(false);
     const [viewport, setViewport] = useState<ViewportTransform>({ x: 0, y: 0, k: 1 });
@@ -327,6 +331,16 @@ export default function CollabRoomPage() {
                     {realtimeStatus === "connected" ? <Wifi className="size-3.5" /> : <WifiOff className="size-3.5" />}
                     {REALTIME_STATUS_LABEL[realtimeStatus]}
                 </div>
+                <button
+                    type="button"
+                    onClick={() => setCanvasTool((current) => (current === "pan" ? "select" : "pan"))}
+                    className="flex h-9 items-center gap-1 rounded-lg border px-3 text-sm font-medium backdrop-blur transition hover:opacity-80"
+                    style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
+                    title={canvasTool === "pan" ? "切换为选择（可拖动与双击编辑节点）" : "切换为移动画布"}
+                >
+                    {canvasTool === "pan" ? <Hand className="size-4" /> : <MousePointer2 className="size-4" />}
+                    {canvasTool === "pan" ? "移动画布" : "选择"}
+                </button>
                 {editable ? (
                     <button
                         type="button"
@@ -362,7 +376,7 @@ export default function CollabRoomPage() {
             <InfiniteCanvas
                 containerRef={containerRef}
                 viewport={viewport}
-                tool="pan"
+                tool={canvasTool}
                 backgroundMode="lines"
                 onViewportChange={setViewport}
                 onCanvasDeselect={handleCanvasDeselect}
