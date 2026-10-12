@@ -25,6 +25,11 @@ const (
 	MaxNodeTitleRunes     = 512
 	MaxIDLength           = 64
 	MinIDLength           = 4
+	// MaxNodeMetadataBytes 是单个节点 metadata 序列化为 JSON 后的最大字节数（1 MiB）。
+	// 依据：directorProject 当前是 public 大对象（contract.md 8.2 开放点 2），需要
+	// 容纳正常导演台项目；超过 1 MiB 的单节点 metadata 视为异常负载，返回
+	// CodeInvalidPayload（invalid_payload），避免任意已登录账号用超大 metadata 消耗内存。
+	MaxNodeMetadataBytes = 1 << 20
 )
 
 // NodeKind 是画布节点种类，与 web/src/app/(user)/canvas/types.ts 的
@@ -350,6 +355,9 @@ func ValidateNode(node *Node) error {
 			return newError(CodeForbiddenField, fmt.Sprintf("字段 %q 属于凭据/私有数据，禁止进入公共图", key))
 		}
 	}
+	if err := validateMetadataSize(node.Metadata); err != nil {
+		return err
+	}
 	for _, key := range requiredMetadata[node.Kind] {
 		value, ok := node.Metadata[key]
 		if !ok {
@@ -385,6 +393,22 @@ func validateJSONObject(value any) error {
 	return nil
 }
 
+// validateMetadataSize 限制单个节点 metadata 的序列化字节数，超限返回 invalid_payload。
+// 空 metadata 直接通过，避免无意义的序列化开销。
+func validateMetadataSize(metadata map[string]any) error {
+	if len(metadata) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return newError(CodeInvalidPayload, "metadata 无法序列化")
+	}
+	if len(encoded) > MaxNodeMetadataBytes {
+		return newError(CodeInvalidPayload, fmt.Sprintf("节点 metadata 超过上限 %d 字节", MaxNodeMetadataBytes))
+	}
+	return nil
+}
+
 // --- 操作与批次校验 ---
 
 // ValidateOperation 校验单个操作，返回带错误码的 *Error。
@@ -414,6 +438,15 @@ func ValidateOperation(op Operation) error {
 		for key := range op.Fields {
 			if IsForbiddenBroadcastKey(key) {
 				return newError(CodeForbiddenField, fmt.Sprintf("字段 %q 属于凭据/私有数据，禁止写入公共图", key))
+			}
+		}
+		if raw, ok := op.Fields["metadata"]; ok {
+			metadata, ok := raw.(map[string]any)
+			if !ok {
+				return newError(CodeInvalidPayload, "update 的 metadata 必须是对象")
+			}
+			if err := validateMetadataSize(metadata); err != nil {
+				return err
 			}
 		}
 		return nil
