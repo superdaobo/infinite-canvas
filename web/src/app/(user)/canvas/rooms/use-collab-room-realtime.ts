@@ -28,7 +28,7 @@ import { useUserStore } from "@/stores/use-user-store";
 export type CollabRealtimeStatus = "connecting" | "connected" | "reconnecting" | "revoked" | "offline";
 
 export type CollabRealtimeHandlers = {
-    applyRemoteChanges: (changes: CollabChangeView[]) => void;
+    applyRemoteChanges: (changes: CollabChangeView[], revision?: number) => void;
     applyRemoteSnapshot: (snapshot: { revision: number; nodes: CollabNodeView[]; edges: CollabEdgeView[] }) => void;
     resumePending: () => void;
 };
@@ -160,7 +160,7 @@ export function useCollabRoomRealtime(roomId: string, enabled: boolean, revision
                     return;
                 }
                 case "changes": {
-                    handlersRef.current.applyRemoteChanges(event.changes || []);
+                    handlersRef.current.applyRemoteChanges(event.changes || [], event.revision);
                     return;
                 }
                 case "presence": {

@@ -64,6 +64,7 @@ func DB() (*gorm.DB, error) {
 		if dbErr != nil {
 			return
 		}
+		configureSQLitePool(driver, dsn, db)
 		dbErr = db.AutoMigrate(
 			&model.User{},
 			&model.CreditLog{},
@@ -96,6 +97,22 @@ func DB() (*gorm.DB, error) {
 		)
 	})
 	return db, dbErr
+}
+
+// configureSQLitePool 处理 SQLite 的单写者限制：多人协作时同一进程内会有多个成员
+// 同时提交操作，默认连接池下并发写会直接返回 SQLITE_BUSY，导致操作失败、节点丢失。
+// 这里把连接池限制为 1 使同进程写入串行化，并对文件库开启 WAL 提升读并发。
+func configureSQLitePool(driver, dsn string, db *gorm.DB) {
+	if driver != "sqlite" || db == nil {
+		return
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	if dsn != ":memory:" {
+		_ = db.Exec("PRAGMA journal_mode=WAL").Error
+		_ = db.Exec("PRAGMA busy_timeout=5000").Error
+	}
 }
 
 func dialector(driver string, dsn string) gorm.Dialector {
