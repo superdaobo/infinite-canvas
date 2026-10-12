@@ -1,5 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
-import { BACKEND_PORT, BACKEND_URL, FRONTEND_URL, REPO_ROOT, WEB_DIR } from "./fixtures/env";
+import { BACKEND_PORT, BACKEND_URL, COLLAB_WS_BASE, FRONTEND_URL, REPO_ROOT, WEB_DIR } from "./fixtures/env";
 
 /**
  * 一条命令（npm test / npx playwright test）即可拉起本地 Go 后端（sqlite）与 Next.js 前端。
@@ -36,7 +36,9 @@ export default defineConfig({
     ],
     webServer: [
         {
-            command: "go run .",
+            // 先编译成独立二进制再运行：`go run .` 会派生子进程，Playwright 终止 webServer
+            // 时子进程会残留并占住端口，导致收尾阶段挂起。独立二进制是单进程，可干净退出。
+            command: "go build -o e2e/e2e-backend.exe . && e2e\\e2e-backend.exe",
             cwd: REPO_ROOT,
             url: `${BACKEND_URL}/api/health`,
             reuseExistingServer: !process.env.CI,
@@ -60,6 +62,11 @@ export default defineConfig({
             timeout: 300_000,
             env: {
                 API_BASE_URL: BACKEND_URL,
+                // Next 的 /api/[...path] 只能代理普通 HTTP，无法代理 WebSocket 升级。
+                // 前端已支持用 NEXT_PUBLIC_COLLAB_WS_BASE 覆盖协作 WS 地址（见
+                // web/src/services/api/collab-realtime.ts::buildCollabWSURL），
+                // 这里让浏览器直连 Go 后端的 WS 端点，绕开 Next 代理。
+                NEXT_PUBLIC_COLLAB_WS_BASE: COLLAB_WS_BASE,
             },
             stdout: "pipe",
             stderr: "pipe",

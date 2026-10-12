@@ -4,3 +4,4 @@ playwright-report/
 blob-report/
 .playwright/
 *.log
+e2e-backend.exe

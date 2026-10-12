@@ -14,3 +14,7 @@ export const FRONTEND_PORT = Number(process.env.E2E_FRONTEND_PORT || 3000);
 
 export const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
 export const FRONTEND_URL = `http://127.0.0.1:${FRONTEND_PORT}`;
+
+// 协作 WebSocket 直连地址：Next 的 /api/[...path] 无法代理 WS 升级，
+// 前端通过 NEXT_PUBLIC_COLLAB_WS_BASE 指向 Go 后端（见 collab-realtime.ts）。
+export const COLLAB_WS_BASE = `ws://127.0.0.1:${BACKEND_PORT}`;
