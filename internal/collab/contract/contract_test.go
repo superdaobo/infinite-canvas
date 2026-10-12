@@ -2,6 +2,7 @@ package contract
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -338,6 +339,65 @@ func TestErrorStatusMapping(t *testing.T) {
 	}
 	if err := ValidateNode(nil); err == nil {
 		t.Fatal("nil 节点应报错")
+	}
+}
+
+// TestValidateNode_MetadataSizeLimit 覆盖节点 metadata 显式大小上限：
+// 正常规模 directorProject 通过，超限单节点 metadata 返回 invalid_payload。
+func TestValidateNode_MetadataSizeLimit(t *testing.T) {
+	base := func(metadata map[string]any) Node {
+		return Node{ID: "dir_1As4dF6gHj7", Kind: NodeKindDirector, Title: "导演台", Version: 1,
+			Position: Position{X: 0, Y: 0}, Width: 10, Height: 10, Metadata: metadata}
+	}
+
+	// 正常规模 directorProject（含多镜头）必须通过。
+	normal := base(map[string]any{
+		"directorProject": map[string]any{
+			"shots": []any{
+				map[string]any{"id": "shot_1", "prompt": "远景推进", "duration": 5},
+				map[string]any{"id": "shot_2", "prompt": "特写", "duration": 3},
+			},
+			"camera": "dolly",
+		},
+	})
+	if err := ValidateNode(&normal); err != nil {
+		t.Fatalf("正常规模 directorProject 被拒绝：%v", err)
+	}
+
+	// 上限之内的大对象仍通过（回归：不要把正常大 payload 误杀）。
+	under := base(map[string]any{"directorProject": strings.Repeat("a", MaxNodeMetadataBytes/2)})
+	if err := ValidateNode(&under); err != nil {
+		t.Fatalf("上限内 metadata 被拒绝：%v", err)
+	}
+
+	// 单个 metadata 字段超过上限：必须返回 invalid_payload。
+	oversized := base(map[string]any{"directorProject": strings.Repeat("a", MaxNodeMetadataBytes+1)})
+	assertCode(t, ValidateNode(&oversized), CodeInvalidPayload)
+}
+
+// TestValidateEnvelope_RejectsOversizedUpdateMetadata 覆盖 update 路径携带超大
+// metadata 时在契约层被拒绝（不依赖 service 层白名单）。
+func TestValidateEnvelope_RejectsOversizedUpdateMetadata(t *testing.T) {
+	version := 1
+	envelope := Envelope{
+		ProtocolVersion: ProtocolVersion,
+		RoomID:          "room_1Ab2Cd3Ef4",
+		OperationID:     "op_9Zy8Xw7Vu6",
+		Operations: []Operation{
+			{Type: OpUpdate, ID: "dir_1As4dF6gHj7", Version: &version,
+				Fields: map[string]any{"metadata": map[string]any{"directorProject": strings.Repeat("a", MaxNodeMetadataBytes+1)}}},
+		},
+	}
+	assertCode(t, ValidateEnvelope(envelope), CodeInvalidPayload)
+
+	// 正常规模的 metadata 更新仍通过。
+	okEnvelope := envelope
+	okEnvelope.Operations = []Operation{
+		{Type: OpUpdate, ID: "dir_1As4dF6gHj7", Version: &version,
+			Fields: map[string]any{"metadata": map[string]any{"directorProject": map[string]any{"shots": []any{}}}}},
+	}
+	if err := ValidateEnvelope(okEnvelope); err != nil {
+		t.Fatalf("正常 metadata 更新被拒绝：%v", err)
 	}
 }
 
