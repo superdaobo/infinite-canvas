@@ -10,8 +10,11 @@ import (
 	"github.com/tigerowo/infinite-canvas/model"
 )
 
-// sendBufferSize 是单连接发送队列长度；队列满时丢弃最旧语义的新消息（背压保护）。
+// sendBufferSize 是单连接发送队列长度；队列满时显式降级为断线重连（见 Client.enqueue），绝不静默丢弃。
 const sendBufferSize = 64
+
+// maxPendingEvents 是快照订阅态期间单连接允许缓冲的广播上限；超出即显式降级为断线重连。
+const maxPendingEvents = 1024
 
 // writeTimeout 是单帧写超时，避免慢客户端阻塞广播。
 const writeTimeout = 10 * time.Second
@@ -19,11 +22,13 @@ const writeTimeout = 10 * time.Second
 // cursorThrottle 是单连接协作光标的最小上行间隔，节流合并避免刷屏。
 const cursorThrottle = 50 * time.Millisecond
 
-// 自定义关闭码：4401 未授权/会话失效，4403 非成员/无权限，4429 连接数超限。
+// 自定义关闭码：4401 未授权/会话失效，4403 非成员/无权限，
+// 4409 需重连重新快照（发送队列溢出或快照期间积压过多），4429 连接数超限。
 const (
-	closeUnauthorized websocket.StatusCode = 4401
-	closeForbidden    websocket.StatusCode = 4403
-	closeTooMany      websocket.StatusCode = 4429
+	closeUnauthorized   websocket.StatusCode = 4401
+	closeForbidden      websocket.StatusCode = 4403
+	closeResyncRequired websocket.StatusCode = 4409
+	closeTooMany        websocket.StatusCode = 4429
 )
 
 // Client 是一条已鉴权的房间 WS 连接。
@@ -38,11 +43,23 @@ type Client struct {
 	send chan []byte
 	done chan struct{}
 
+	// 以下字段仅在 hub 锁内访问：快照订阅态与期间缓冲的广播（见 registerPending/activate）。
+	syncing bool
+	pending []pendingEvent
+
 	closeOnce   sync.Once
 	closeCode   websocket.StatusCode
 	closeReason string
 
 	lastCursor atomicInt64
+}
+
+// pendingEvent 是快照订阅态期间缓冲的一条广播。
+// change=true 时 revision 用于 activate 时的补发过滤（revision <= 快照 revision 的已在快照里）。
+type pendingEvent struct {
+	payload  []byte
+	revision int64
+	change   bool
 }
 
 // Hub 维护所有房间的在线连接，负责广播、在线状态与强制断开。
@@ -59,17 +76,42 @@ func NewHub() *Hub {
 // Default 是进程级 Hub。
 var Default = NewHub()
 
-// register 把连接加入房间并广播最新在线成员。
-func (h *Hub) register(c *Client) {
+// registerPending 把连接加入房间并置为快照订阅态。
+//
+// 快照订阅态下该连接收到的广播只进 pending 缓冲、不写 socket；待调用方取到快照后
+// 调用 activate 按 revision 补发。由此形成「注册 → 取快照 → 补发」的原子边界：
+// 注册之后、快照 revision 之前的修改都落在快照里，快照 revision 之后的修改由 pending
+// 补发，任何时刻的修改要么在快照里、要么以 changes 送达，不丢（PR #47 P1 丢同步）。
+func (h *Hub) registerPending(c *Client) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	room := h.rooms[c.roomID]
 	if room == nil {
 		room = make(map[*Client]struct{})
 		h.rooms[c.roomID] = room
 	}
+	c.syncing = true
 	room[c] = struct{}{}
 	h.broadcastPresenceLocked(c.roomID)
-	h.mu.Unlock()
+}
+
+// activate 结束快照订阅态：把 pending 缓冲按快照 revision 过滤后补发。
+// revision <= snapshotRevision 的 changes 已包含在快照中，丢弃；其余（含全部非 changes 事件）补发。
+// 必须在快照帧全部写出之后、写循环启动之后调用。
+func (h *Hub) activate(c *Client, snapshotRevision int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !c.syncing {
+		return
+	}
+	for _, event := range c.pending {
+		if event.change && event.revision <= snapshotRevision {
+			continue
+		}
+		c.enqueue(event.payload)
+	}
+	c.pending = nil
+	c.syncing = false
 }
 
 // unregister 移除连接并广播最新在线成员。幂等。
@@ -108,7 +150,7 @@ func (h *Hub) BroadcastChanges(roomID string, result model.RoomBatchResult) {
 		Revision:    result.Revision,
 		Changes:     ChangeViews(result.Changes),
 	}
-	h.broadcast(roomID, event)
+	h.broadcastWithRevision(roomID, event, result.Revision, true, "")
 }
 
 // BroadcastCursors 把一条协作光标节流合并后广播给同房间其他连接（不回显给发送者）。
@@ -117,7 +159,7 @@ func (h *Hub) BroadcastCursors(roomID, userID, username string, position Positio
 		Type:    EventCursors,
 		Cursors: []CursorInfo{{UserID: userID, Username: username, Position: position}},
 	}
-	h.broadcastExceptUser(roomID, userID, event)
+	h.broadcastWithRevision(roomID, event, 0, false, userID)
 }
 
 // DisconnectUser 关闭某用户在某房间的全部连接（成员移除、角色降级、登出）。
@@ -165,33 +207,35 @@ func (h *Hub) DisconnectRoom(roomID, reason string) {
 	}
 }
 
-// broadcast 向房间全部连接入队一条事件。
-func (h *Hub) broadcast(roomID string, event any) {
+// broadcastWithRevision 向房间连接入队一条事件。revision 仅对 changes 有意义（change=true），
+// 用于快照订阅态下按 revision 过滤补发；exceptUserID 非空时跳过该用户的连接（光标不回显）。
+func (h *Hub) broadcastWithRevision(roomID string, event any, revision int64, change bool, exceptUserID string) {
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return
 	}
 	h.mu.Lock()
 	for c := range h.rooms[roomID] {
-		c.enqueue(payload)
+		if exceptUserID != "" && c.userID == exceptUserID {
+			continue
+		}
+		h.deliverLocked(c, payload, revision, change)
 	}
 	h.mu.Unlock()
 }
 
-// broadcastExceptUser 向房间内除指定用户外的连接入队一条事件。
-func (h *Hub) broadcastExceptUser(roomID, exceptUserID string, event any) {
-	payload, err := json.Marshal(event)
-	if err != nil {
+// deliverLocked 在持有 hub 锁时把一条广播交给连接：快照订阅态进 pending 缓冲，
+// 否则直接入发送队列。队列溢出时显式降级为断线重连（见 enqueue/resync）。
+func (h *Hub) deliverLocked(c *Client, payload []byte, revision int64, change bool) {
+	if c.syncing {
+		if len(c.pending) >= maxPendingEvents {
+			c.resync("快照期间变更积压过多，需重新同步")
+			return
+		}
+		c.pending = append(c.pending, pendingEvent{payload: payload, revision: revision, change: change})
 		return
 	}
-	h.mu.Lock()
-	for c := range h.rooms[roomID] {
-		if c.userID == exceptUserID {
-			continue
-		}
-		c.enqueue(payload)
-	}
-	h.mu.Unlock()
+	c.enqueue(payload)
 }
 
 // broadcastPresenceLocked 计算并广播房间在线成员（按 userId 去重）。调用方需持有锁。
@@ -211,11 +255,12 @@ func (h *Hub) broadcastPresenceLocked(roomID string) {
 		return
 	}
 	for c := range h.rooms[roomID] {
-		c.enqueue(payload)
+		h.deliverLocked(c, payload, 0, false)
 	}
 }
 
-// enqueue 非阻塞入队；队列满或连接已关闭时丢弃，绝不阻塞广播方。
+// enqueue 非阻塞入队；队列满或连接已关闭时立即返回。队列满时显式降级为断线重连，
+// 由客户端重连后按 revision 重新快照，绝不静默丢弃 changes（PR #47 P1）。
 func (c *Client) enqueue(payload []byte) {
 	select {
 	case <-c.done:
@@ -226,6 +271,17 @@ func (c *Client) enqueue(payload []byte) {
 	case c.send <- payload:
 	case <-c.done:
 	default:
+		c.resync("发送队列溢出，需重新同步")
+	}
+}
+
+// resync 显式降级：标记关闭并立即断开底层连接，促使客户端重连后重新快照。
+// 慢客户端可能仍阻塞在旧写操作上，故直接 CloseNow 解除读写阻塞；客户端观察到非正常
+// 关闭（非 4401/4403）后按断线恢复规则重连并重新拉取快照。
+func (c *Client) resync(reason string) {
+	c.close(closeResyncRequired, reason)
+	if c.conn != nil {
+		_ = c.conn.CloseNow()
 	}
 }
 

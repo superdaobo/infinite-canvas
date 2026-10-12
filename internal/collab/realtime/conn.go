@@ -80,12 +80,6 @@ func Serve(w http.ResponseWriter, r *http.Request, roomID string, resolver RoomR
 		return
 	}
 
-	title, revision, nodes, edges, err := resolver.LoadSnapshot(roomID)
-	if err != nil {
-		closeWithError(conn, websocket.StatusInternalError, contract.CodeNotFound, "房间快照读取失败")
-		return
-	}
-
 	client := &Client{
 		hub:      Default,
 		conn:     conn,
@@ -95,6 +89,18 @@ func Serve(w http.ResponseWriter, r *http.Request, roomID string, resolver RoomR
 		role:     role,
 		send:     make(chan []byte, sendBufferSize),
 		done:     make(chan struct{}),
+	}
+
+	// 先注册为快照订阅态，再读取快照：从注册这一刻起的 changes 都进 pending 缓冲，
+	// 与随后取到的快照 revision 形成原子边界，消除「取到 revision 到 register 之间」
+	// 的丢同步空窗（PR #47 P1）。
+	Default.registerPending(client)
+
+	title, revision, nodes, edges, err := resolver.LoadSnapshot(roomID)
+	if err != nil {
+		Default.unregister(client)
+		closeWithError(conn, websocket.StatusInternalError, contract.CodeNotFound, "房间快照读取失败")
+		return
 	}
 
 	// 回发 hello 连接确认：协议版本、身份、角色与当前 revision。
@@ -109,6 +115,7 @@ func Serve(w http.ResponseWriter, r *http.Request, roomID string, resolver RoomR
 	})
 	cancel()
 	if err != nil {
+		Default.unregister(client)
 		return
 	}
 
@@ -116,11 +123,14 @@ func Serve(w http.ResponseWriter, r *http.Request, roomID string, resolver RoomR
 	// 落后或未带 revision 时全量分帧重建。
 	needSnapshot := hello.Revision == nil || *hello.Revision != revision
 	if err := sendSnapshot(client, userID, role, title, revision, nodes, edges, needSnapshot); err != nil {
+		Default.unregister(client)
 		return
 	}
 
-	Default.register(client)
+	// 先启动写循环再补发：使 pending 里的 changes 能即时被消费，避免补发瞬间打满发送队列。
 	go client.writeLoop()
+	// 结束订阅态：按快照 revision 补发期间的 changes（revision <= 快照的已在快照里，丢弃）。
+	Default.activate(client, revision)
 	go client.pingLoop()
 	client.readLoop()
 	Default.unregister(client)
