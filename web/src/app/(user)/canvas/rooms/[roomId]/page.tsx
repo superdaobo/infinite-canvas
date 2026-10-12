@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { AlertTriangle, ChevronLeft, Hand, Loader2, MousePointer2, Plus, RefreshCw, Share2, Trash2, Users, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, ChevronLeft, Hand, Loader2, MousePointer2, Plus, RefreshCw, Redo2, Share2, Trash2, Undo2, Users, Wifi, WifiOff, X } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import type { CollabCursorInfo } from "@/services/api/collab-realtime";
@@ -11,19 +11,45 @@ import { CanvasNode } from "../../components/canvas-node";
 import { ConnectionPath } from "../../components/canvas-connections";
 import { InfiniteCanvas } from "../../components/infinite-canvas";
 import { isSharedCanvasEnabled } from "../../mode";
-import type { Position, ViewportTransform } from "../../types";
+import type { CanvasNodeData, Position, ViewportTransform } from "../../types";
 import { CollabSharingPanel } from "../collab-sharing-panel";
 import { useCollabInviteJoin } from "../use-collab-invite-join";
-import { useCollabRoomEditing } from "../use-collab-room-editing";
+import { useCollabRoomEditing, type CollabConflict } from "../use-collab-room-editing";
+import { useCollabRoomHistory } from "../use-collab-room-history";
 import { useCollabRoomRealtime, type CollabRealtimeStatus } from "../use-collab-room-realtime";
 
 // 共享房间画布入口：/canvas/rooms/:roomId
 // 与单人项目路由 /canvas/:projectId 完全分离，使用独立状态边界（不使用 useCanvasStore）。
 // 编辑能力按 #13 交付：节点/连线变更构造为协作操作并经服务端回执确认（见 use-collab-room-editing）。
 // 实时接收按 #14 交付：ticket 建连、分帧快照、changes、presence、cursors 与断线恢复（见 use-collab-room-realtime）。
+// 冲突处理/草稿保留/撤销重做按 #15 交付：409 冲突可选择安全应用，未确认草稿刷新后仍保留，
+// 撤销/重做按用户隔离并接入 #11 历史接口（见 use-collab-room-editing / use-collab-room-history）。
 
 const noop = () => undefined;
 const TEXT_NODE_SIZE = { width: 360, height: 200 };
+
+// 冲突差异摘要：只展示本地草稿与服务端最新版本之间的公开字段差异，供用户安全选择。
+function describeNodeConflict(local: CanvasNodeData | null, server: CanvasNodeData | null): string[] {
+    if (!local || !server) return [];
+    const lines: string[] = [];
+    if (local.title !== server.title) lines.push(`标题：本地「${local.title || "空"}」/ 服务端「${server.title || "空"}」`);
+    const localContent = typeof local.metadata?.content === "string" ? local.metadata.content : "";
+    const serverContent = typeof server.metadata?.content === "string" ? server.metadata.content : "";
+    if (localContent !== serverContent) lines.push(`内容：本地 ${localContent.length} 字 / 服务端 ${serverContent.length} 字`);
+    if (local.position.x !== server.position.x || local.position.y !== server.position.y) {
+        lines.push(`位置：本地 (${Math.round(local.position.x)}, ${Math.round(local.position.y)}) / 服务端 (${Math.round(server.position.x)}, ${Math.round(server.position.y)})`);
+    }
+    if (local.width !== server.width || local.height !== server.height) {
+        lines.push(`尺寸：本地 ${Math.round(local.width)}×${Math.round(local.height)} / 服务端 ${Math.round(server.width)}×${Math.round(server.height)}`);
+    }
+    return lines.slice(0, 4);
+}
+
+function conflictTitle(conflict: CollabConflict) {
+    if (conflict.code === "node_deleted") return "该节点已被其他成员删除";
+    if (conflict.code === "edge_changed") return "该连线已被其他成员修改";
+    return "该节点已被其他成员修改";
+}
 
 // 协作光标配色：按 userId 稳定取色，保证同一成员各端颜色一致。
 const CURSOR_COLORS = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899"];
@@ -79,6 +105,7 @@ export default function CollabRoomPage() {
         loading,
         loadError,
         pending,
+        conflict,
         canEdit,
         createTextNode,
         moveNode,
@@ -90,6 +117,9 @@ export default function CollabRoomPage() {
         disconnectEdge,
         flushNow,
         retryPending,
+        resolveConflictUseServer,
+        resolveConflictKeepLocal,
+        applyServerChanges,
         applyRemoteChanges,
         applyRemoteSnapshot,
     } = useCollabRoomEditing(params.roomId, sharedEnabled);
@@ -99,6 +129,8 @@ export default function CollabRoomPage() {
         applyRemoteSnapshot,
         resumePending: retryPending,
     });
+    // 协作撤销/重做（#15）：接入 #11 历史接口，按用户隔离，仅撤销本人操作。
+    const history = useCollabRoomHistory(params.roomId, sharedEnabled);
     const colorTheme = useThemeStore((state) => state.theme);
     const theme = canvasThemes[colorTheme];
     // 邀请链接加入（#16）：读取 fragment 令牌，未登录先登录，登录后自动 accept。
@@ -156,6 +188,43 @@ export default function CollabRoomPage() {
         const handleMouseUp = () => flushNowRef.current();
         window.addEventListener("mouseup", handleMouseUp);
         return () => window.removeEventListener("mouseup", handleMouseUp);
+    }, []);
+
+    // 撤销/重做：成功后把回执 changes 应用到本地共享图（WS 广播按版本去重，不会重复应用）。
+    async function handleUndo() {
+        const result = await history.undo();
+        if (result) applyServerChanges(result.changes);
+    }
+
+    async function handleRedo() {
+        const result = await history.redo();
+        if (result) applyServerChanges(result.changes);
+    }
+
+    const undoRef = useRef<() => void>(noop);
+    const redoRef = useRef<() => void>(noop);
+    undoRef.current = () => void handleUndo();
+    redoRef.current = () => void handleRedo();
+
+    // 撤销/重做快捷键：Ctrl/⌘+Z 撤销，Ctrl+Y 或 Ctrl+Shift+Z 重做；输入态不拦截。
+    useEffect(() => {
+        const handleHistoryKey = (event: KeyboardEvent) => {
+            if (!canEditRef.current || !(event.ctrlKey || event.metaKey)) return;
+            const target = event.target as HTMLElement | null;
+            if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+            const key = event.key.toLowerCase();
+            if (key === "z" && !event.shiftKey) {
+                event.preventDefault();
+                undoRef.current();
+                return;
+            }
+            if (key === "y" || (key === "z" && event.shiftKey)) {
+                event.preventDefault();
+                redoRef.current();
+            }
+        };
+        window.addEventListener("keydown", handleHistoryKey);
+        return () => window.removeEventListener("keydown", handleHistoryKey);
     }, []);
 
     // 上报本端协作光标：换算为画布世界坐标，客户端节流后由服务端再次节流合并。
@@ -217,6 +286,9 @@ export default function CollabRoomPage() {
         });
         return map;
     }, [nodes]);
+
+    // 冲突差异摘要：本地草稿 vs 服务端最新版本，帮助用户安全选择。
+    const conflictDiff = useMemo(() => (conflict ? describeNodeConflict(conflict.localNode, conflict.serverNode) : []), [conflict]);
 
     function canvasCenterPosition(): Position {
         const rect = containerRef.current?.getBoundingClientRect();
@@ -342,6 +414,32 @@ export default function CollabRoomPage() {
                     {canvasTool === "pan" ? "移动画布" : "选择"}
                 </button>
                 {editable ? (
+                    <>
+                        <button
+                            type="button"
+                            disabled={!history.undoTarget || history.busy}
+                            onClick={() => void handleUndo()}
+                            className="flex h-9 items-center gap-1 rounded-lg border px-3 text-sm font-medium backdrop-blur transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
+                            style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
+                            title="撤销（Ctrl/⌘+Z，仅撤销本人操作）"
+                        >
+                            <Undo2 className="size-4" />
+                            撤销
+                        </button>
+                        <button
+                            type="button"
+                            disabled={!history.redoTarget || history.busy}
+                            onClick={() => void handleRedo()}
+                            className="flex h-9 items-center gap-1 rounded-lg border px-3 text-sm font-medium backdrop-blur transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
+                            style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
+                            title="重做（Ctrl+Y / Ctrl+Shift+Z，仅重做本人操作）"
+                        >
+                            <Redo2 className="size-4" />
+                            重做
+                        </button>
+                    </>
+                ) : null}
+                {editable ? (
                     <button
                         type="button"
                         onClick={handleCreateTextNode}
@@ -441,7 +539,7 @@ export default function CollabRoomPage() {
                 </div>
             ) : null}
 
-            {pending.count > 0 || pending.error ? (
+            {(pending.count > 0 || pending.error) && !conflict ? (
                 <div
                     className="absolute bottom-4 left-4 z-[90] flex max-w-[420px] items-start gap-2 rounded-lg border px-3 py-2 text-xs backdrop-blur"
                     style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
@@ -465,6 +563,55 @@ export default function CollabRoomPage() {
                             重试
                         </button>
                     ) : null}
+                </div>
+            ) : null}
+
+            {conflict ? (
+                <div
+                    className="absolute bottom-6 left-1/2 z-[92] w-[min(560px,calc(100vw-2rem))] -translate-x-1/2 rounded-lg border px-4 py-3 text-sm backdrop-blur"
+                    style={{ background: theme.toolbar.panel, borderColor: "#f59e0b", color: theme.node.text }}
+                >
+                    <div className="flex items-start gap-2">
+                        <AlertTriangle className="mt-0.5 size-4 shrink-0" style={{ color: "#f59e0b" }} />
+                        <div className="flex-1 space-y-1">
+                            <div className="font-medium">{conflictTitle(conflict)}</div>
+                            <div className="text-xs opacity-70">
+                                {conflict.targetKind === "node" ? "节点" : "连线"} {conflict.targetId}
+                                {conflict.serverVersion !== null ? ` · 服务端版本 v${conflict.serverVersion}` : ""}
+                            </div>
+                            {conflictDiff.length ? (
+                                <ul className="space-y-0.5 text-xs opacity-80">
+                                    {conflictDiff.map((line) => (
+                                        <li key={line}>· {line}</li>
+                                    ))}
+                                </ul>
+                            ) : null}
+                            <div className="text-xs opacity-70">你的草稿已保留，不会被静默丢弃。</div>
+                        </div>
+                    </div>
+                    <div className="mt-3 flex items-center justify-end gap-2">
+                        <button type="button" onClick={resolveConflictUseServer} className="rounded border px-3 py-1.5 text-xs transition hover:opacity-80" style={{ borderColor: theme.toolbar.border }}>
+                            用服务端最新版本
+                        </button>
+                        <button type="button" onClick={resolveConflictKeepLocal} className="rounded border px-3 py-1.5 text-xs font-medium transition hover:opacity-80" style={{ borderColor: "#f59e0b", color: theme.node.text }}>
+                            保留本地草稿并重试
+                        </button>
+                    </div>
+                </div>
+            ) : null}
+
+            {history.error ? (
+                <div className="absolute inset-x-0 top-28 z-[94] grid place-items-center px-4">
+                    <div
+                        className="flex items-start gap-2 rounded-lg border px-4 py-2 text-sm backdrop-blur"
+                        style={{ background: theme.toolbar.panel, borderColor: history.invalidated ? "#f59e0b" : "#ef4444", color: history.invalidated ? "#f59e0b" : "#ef4444" }}
+                    >
+                        <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                        <span>{history.error}</span>
+                        <button type="button" onClick={history.clearError} className="ml-2 opacity-70 transition hover:opacity-100" title="关闭">
+                            <X className="size-3.5" />
+                        </button>
+                    </div>
                 </div>
             ) : null}
 

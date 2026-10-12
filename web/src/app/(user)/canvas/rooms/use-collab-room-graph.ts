@@ -2,8 +2,9 @@
 
 import { useEffect, useState } from "react";
 
+import type { CollabRoomChange } from "@/services/api/collab-operations";
 import { fetchCollabRoom, fetchCollabRoomGraph, type CollabRoom, type CollabRoomGraph } from "@/services/api/collab-rooms";
-import type { CollabEdgeView, CollabNodeView } from "@/services/api/collab-realtime";
+import type { CollabChangeView, CollabEdgeView, CollabNodeView } from "@/services/api/collab-realtime";
 import { useUserStore } from "@/stores/use-user-store";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata } from "../types";
 
@@ -60,6 +61,32 @@ export function collabNodeViewToCanvas(view: CollabNodeView): CanvasNodeData | n
 
 export function collabEdgeViewToConnection(edge: CollabEdgeView): CanvasConnection {
     return { id: edge.id, fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId };
+}
+
+// 提交回执 / 撤销重做回执的 RoomChange（metadata 为 JSON 字符串）转换为 WS 广播视图，
+// 以便复用同一套本地合并逻辑（applyRemoteChanges）。delete 只用到 id。
+export function collabRoomChangeToView(change: CollabRoomChange): CollabChangeView | null {
+    if (change.node) {
+        const node = change.node;
+        return {
+            type: change.type,
+            node: {
+                id: node.id,
+                kind: node.kind,
+                title: node.title,
+                position: { x: node.positionX, y: node.positionY },
+                width: node.width,
+                height: node.height,
+                version: node.version,
+                metadata: parseRoomMetadata(node.metadata),
+            },
+        };
+    }
+    if (change.edge) {
+        const edge = change.edge;
+        return { type: change.type, edge: { id: edge.id, fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId, version: edge.version } };
+    }
+    return null;
 }
 
 export function useCollabRoomGraph(roomId: string, enabled: boolean) {
