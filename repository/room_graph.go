@@ -147,6 +147,7 @@ func applyOperations(tx *gorm.DB, roomID string, ops []contract.Operation) ([]mo
 	now := time.Now().UTC()
 	changes := make([]model.RoomChange, 0, len(ops))
 	history := make([]model.RoomHistoryOp, 0, len(ops))
+	deletedNode := false
 	for _, op := range ops {
 		switch op.Type {
 		case contract.OpCreate:
@@ -175,11 +176,21 @@ func applyOperations(tx *gorm.DB, roomID string, ops []contract.Operation) ([]mo
 			if err != nil {
 				return nil, nil, err
 			}
+			deletedNode = true
 			changes = append(changes, model.RoomChange{Type: "delete", Node: &node})
 			history = append(history, model.RoomHistoryOp{
 				Op: "delete", Target: "node", ID: node.ID,
 				Before: nodeState(before), After: nodeState(node), Active: true, Version: node.Version,
 			})
+			// 删除分组节点时同步解除成员归属（清空其成员的 groupId），避免悬空编组引用。
+			if node.Kind == string(contract.NodeKindGroup) {
+				memberChanges, memberHistory, err := releaseGroupMembers(tx, roomID, node.ID, now)
+				if err != nil {
+					return nil, nil, err
+				}
+				changes = append(changes, memberChanges...)
+				history = append(history, memberHistory...)
+			}
 		case contract.OpConnect:
 			edge, before, err := connectEdge(tx, roomID, op, now)
 			if err != nil {
@@ -203,6 +214,15 @@ func applyOperations(tx *gorm.DB, roomID string, ops []contract.Operation) ([]mo
 		default:
 			return nil, nil, contractError(contract.CodeInvalidPayload, fmt.Sprintf("未知操作类型 %q", op.Type), nil)
 		}
+	}
+	// 删除节点后清理关联连线：任何端点已不在房间内的连线都软删除，避免悬空边。
+	if deletedNode {
+		edgeChanges, edgeHistory, err := cascadeDeletedNodeEdges(tx, roomID, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		changes = append(changes, edgeChanges...)
+		history = append(history, edgeHistory...)
 	}
 	if err := validateRoomGraph(tx, roomID); err != nil {
 		return nil, nil, err
@@ -250,6 +270,9 @@ func createNode(tx *gorm.DB, roomID string, node contract.Node, now time.Time) (
 	if err != nil {
 		return model.RoomNode{}, err
 	}
+	if err := validateNodeSemantics(string(node.Kind), node.Metadata); err != nil {
+		return model.RoomNode{}, err
+	}
 	row := model.RoomNode{
 		RoomID: roomID, ID: node.ID, Kind: string(node.Kind), Title: node.Title,
 		PositionX: node.Position.X, PositionY: node.Position.Y,
@@ -283,6 +306,9 @@ func updateNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time
 	// 增量更新后的结果必须仍是合法节点（例如 text/config 必填 content 不能丢）。
 	candidate := rowToContractNode(updated)
 	if err := contract.ValidateNode(&candidate); err != nil {
+		return model.RoomNode{}, model.RoomNode{}, err
+	}
+	if err := validateNodeSemantics(row.Kind, candidate.Metadata); err != nil {
 		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	updated.Version = row.Version + 1
@@ -435,7 +461,51 @@ func validateRoomGraph(tx *gorm.DB, roomID string) error {
 	for _, row := range edgeRows {
 		edges = append(edges, rowToContractEdge(row))
 	}
-	return contract.ValidateGraph(nodes, edges)
+	if err := contract.ValidateGraph(nodes, edges); err != nil {
+		return err
+	}
+	if err := validateUniqueEdgePairs(edges); err != nil {
+		return err
+	}
+	return validateGroupTargets(nodes)
+}
+
+// validateUniqueEdgePairs 拒绝端点完全相同的重复连线（不同 ID 但同 from->to）。
+// 契约 v1 的连线是有向 from->to 简单边，同一方向重复连接没有意义。
+func validateUniqueEdgePairs(edges []contract.Edge) error {
+	pairs := make(map[string]string, len(edges))
+	for _, edge := range edges {
+		key := edge.FromNodeID + "\x00" + edge.ToNodeID
+		if other, ok := pairs[key]; ok {
+			return contractError(contract.CodeDuplicateTarget,
+				fmt.Sprintf("连线 %s 与 %s 端点重复", edge.ID, other),
+				map[string]any{"edgeId": edge.ID, "duplicateOf": other})
+		}
+		pairs[key] = edge.ID
+	}
+	return nil
+}
+
+// validateGroupTargets 校验编组归属：若节点的 groupId 指向房间内已存在的节点，
+// 该目标必须是 group 节点，避免把普通节点当作分组容器。
+func validateGroupTargets(nodes map[string]contract.Node) error {
+	for id, node := range nodes {
+		groupID, _ := node.Metadata["groupId"].(string)
+		groupID = strings.TrimSpace(groupID)
+		if groupID == "" {
+			continue
+		}
+		target, ok := nodes[groupID]
+		if !ok {
+			continue
+		}
+		if target.Kind != contract.NodeKindGroup {
+			return contractError(contract.CodeInvalidPayload,
+				fmt.Sprintf("节点 %s 的 groupId 指向非分组节点 %s", id, groupID),
+				map[string]any{"nodeId": id, "groupId": groupID})
+		}
+	}
+	return nil
 }
 
 func loadNodeForWrite(tx *gorm.DB, roomID, id string) (model.RoomNode, error) {
@@ -600,6 +670,154 @@ func asFloat(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// validateNodeSemantics 校验节点 metadata 的类型化语义（8 类节点通用）：
+//   - references 必须是字符串数组；
+//   - 视频节点的 references 是学校 H3 多图引用，必须为 1..9 张、ID 合法且不重复（顺序稳定）；
+//   - groupId 必须是字符串。
+//
+// 未知字段仍按契约默认 public 处理，这里只约束已知的类型化字段，避免误拒旧项目数据。
+func validateNodeSemantics(kind string, metadata map[string]any) error {
+	if raw, ok := metadata["references"]; ok && raw != nil {
+		refs, err := stringSlice(raw)
+		if err != nil {
+			return contractError(contract.CodeInvalidPayload, "references 必须是字符串数组", nil)
+		}
+		// 空数组等价于「无引用」，不做 H3 数量校验；非空时按 1..9、不重复校验。
+		if kind == string(contract.NodeKindVideo) && len(refs) > 0 {
+			if err := contract.ValidateOrderedReferences(refs); err != nil {
+				return err
+			}
+		}
+	}
+	if raw, ok := metadata["groupId"]; ok && raw != nil {
+		if _, ok := raw.(string); !ok {
+			return contractError(contract.CodeInvalidPayload, "groupId 必须是字符串", nil)
+		}
+	}
+	return nil
+}
+
+// stringSlice 把 JSON 反序列化得到的任意切片归一化为 []string；非字符串元素返回错误。
+func stringSlice(value any) ([]string, error) {
+	switch typed := value.(type) {
+	case []string:
+		return typed, nil
+	case []any:
+		result := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("references 元素必须是字符串")
+			}
+			result = append(result, text)
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("references 必须是数组")
+	}
+}
+
+// decodeMetadata 解析节点 metadata JSON 文本；空文本返回空 map。
+func decodeMetadata(raw string) (map[string]any, error) {
+	metadata := map[string]any{}
+	if strings.TrimSpace(raw) == "" {
+		return metadata, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return nil, err
+	}
+	return metadata, nil
+}
+
+// cascadeDeletedNodeEdges 软删除所有端点已不在房间内的连线，返回 edge-delete 变更与历史。
+// 用于满足「删除节点时正确维护关联连线」：节点删除后其关联连线不得成为悬空边。
+func cascadeDeletedNodeEdges(tx *gorm.DB, roomID string, now time.Time) ([]model.RoomChange, []model.RoomHistoryOp, error) {
+	var liveNodes []model.RoomNode
+	if err := tx.Select("id").Where("room_id = ? AND deleted = ?", roomID, false).Find(&liveNodes).Error; err != nil {
+		return nil, nil, err
+	}
+	live := make(map[string]bool, len(liveNodes))
+	for _, node := range liveNodes {
+		live[node.ID] = true
+	}
+	var edges []model.RoomEdge
+	if err := tx.Where("room_id = ? AND deleted = ?", roomID, false).Find(&edges).Error; err != nil {
+		return nil, nil, err
+	}
+	var changes []model.RoomChange
+	var history []model.RoomHistoryOp
+	for _, edge := range edges {
+		if live[edge.FromNodeID] && live[edge.ToNodeID] {
+			continue
+		}
+		before := edge
+		affected, err := casUpdateEdge(tx, roomID, edge.ID, edge.Version, map[string]any{
+			"deleted": true, "version": edge.Version + 1, "updated_at": now,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if affected == 0 {
+			return nil, nil, edgeWriteConflict(tx, roomID, edge.ID)
+		}
+		deleted := edge
+		deleted.Deleted = true
+		deleted.Version = edge.Version + 1
+		deleted.UpdatedAt = now
+		changes = append(changes, model.RoomChange{Type: "edge-delete", Edge: &deleted})
+		history = append(history, model.RoomHistoryOp{
+			Op: "disconnect", Target: "edge", ID: deleted.ID,
+			Before: edgeState(before), After: edgeState(deleted), Active: true, Version: deleted.Version,
+		})
+	}
+	return changes, history, nil
+}
+
+// releaseGroupMembers 清空所有以 groupID 为归属的节点 metadata.groupId（删除分组时解除编组）。
+// 成员节点保留，仅解除归属；返回对应 upsert 变更与历史。
+func releaseGroupMembers(tx *gorm.DB, roomID, groupID string, now time.Time) ([]model.RoomChange, []model.RoomHistoryOp, error) {
+	var nodes []model.RoomNode
+	if err := tx.Where("room_id = ? AND deleted = ?", roomID, false).Find(&nodes).Error; err != nil {
+		return nil, nil, err
+	}
+	var changes []model.RoomChange
+	var history []model.RoomHistoryOp
+	for _, node := range nodes {
+		metadata, err := decodeMetadata(node.Metadata)
+		if err != nil {
+			return nil, nil, err
+		}
+		if gid, _ := metadata["groupId"].(string); strings.TrimSpace(gid) != groupID {
+			continue
+		}
+		delete(metadata, "groupId")
+		encoded, err := marshalMetadata(metadata)
+		if err != nil {
+			return nil, nil, err
+		}
+		before := node
+		updated := node
+		updated.Metadata = encoded
+		updated.Version = node.Version + 1
+		updated.UpdatedAt = now
+		affected, err := casUpdateNode(tx, roomID, node.ID, node.Version, map[string]any{
+			"metadata": encoded, "version": updated.Version, "updated_at": now,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if affected == 0 {
+			return nil, nil, nodeWriteConflict(tx, roomID, node.ID, node)
+		}
+		changes = append(changes, model.RoomChange{Type: "upsert", Node: &updated})
+		history = append(history, model.RoomHistoryOp{
+			Op: "update", Target: "node", ID: updated.ID,
+			Before: nodeState(before), After: nodeState(updated), Active: true, Version: updated.Version,
+		})
+	}
+	return changes, history, nil
 }
 
 func rowToContractNode(row model.RoomNode) contract.Node {

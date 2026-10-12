@@ -28,8 +28,13 @@ func ApplyRoomOperations(ctx context.Context, roomID string, envelope contract.E
 		return model.RoomBatchResult{}, err
 	}
 	for _, op := range envelope.Operations {
-		if op.Type == contract.OpUpdate {
-			if err := validateUpdateFields(op.Fields); err != nil {
+		switch op.Type {
+		case contract.OpUpdate:
+			if err := normalizeUpdateFields(op.Fields); err != nil {
+				return model.RoomBatchResult{}, err
+			}
+		case contract.OpCreate:
+			if err := normalizeCreateNodeMetadata(op.Node); err != nil {
 				return model.RoomBatchResult{}, err
 			}
 		}
@@ -79,9 +84,28 @@ func ReadRoomGraph(ctx context.Context, roomID string) (model.RoomGraph, error) 
 	return model.RoomGraph{RoomID: roomID, Revision: room.Revision, Nodes: nodes, Edges: edges}, nil
 }
 
-// validateUpdateFields 强制 update 的增量字段白名单：只允许 public/local 字段，
-// 凭据类键返回 forbidden_field，私有 metadata 字段不允许经公共图写入。
-func validateUpdateFields(fields map[string]any) error {
+// normalizeCreateNodeMetadata 校验并归一化 create 节点的 metadata：
+//   - 凭据类键由 contract.ValidateNode 拒绝（forbidden_field）；
+//   - private 字段（owner 独占、绝不广播）禁止进入公共图，返回 invalid_payload；
+//   - local 字段（运行时状态、不落库不广播）直接剥离，不写入公共图。
+func normalizeCreateNodeMetadata(node *contract.Node) error {
+	if node == nil || len(node.Metadata) == 0 {
+		return nil
+	}
+	for key := range node.Metadata {
+		if contract.ClassifyMetadataField(key) == contract.ClassPrivate {
+			return contractFailure(contract.CodeInvalidPayload,
+				"私有 metadata 字段不能进入公共图", map[string]any{"field": key})
+		}
+	}
+	stripLocalMetadata(node.Metadata)
+	return nil
+}
+
+// normalizeUpdateFields 强制 update 的增量字段白名单并归一化 metadata：
+// 只允许 public/local 顶层字段；凭据类键返回 forbidden_field；
+// private metadata 字段不允许经公共图写入（invalid_payload）；local 字段剥离后不落库。
+func normalizeUpdateFields(fields map[string]any) error {
 	for key, value := range fields {
 		switch key {
 		case "title", "position", "width", "height":
@@ -98,11 +122,21 @@ func validateUpdateFields(fields map[string]any) error {
 					return contractFailure(contract.CodeInvalidPayload, "私有 metadata 字段不能通过公共图更新", map[string]any{"field": metaKey})
 				}
 			}
+			stripLocalMetadata(metadata)
 		default:
 			return contractFailure(contract.CodeInvalidPayload, "不支持的更新字段", map[string]any{"field": key})
 		}
 	}
 	return nil
+}
+
+// stripLocalMetadata 删除仅本地/内存、不落库不广播的 metadata 字段（status/progress/startedAt）。
+func stripLocalMetadata(metadata map[string]any) {
+	for key := range metadata {
+		if contract.ClassifyMetadataField(key) == contract.ClassLocal {
+			delete(metadata, key)
+		}
+	}
 }
 
 // requestDigest 计算请求体摘要（不含 operationId，作为幂等键本身）。
