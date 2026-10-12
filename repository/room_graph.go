@@ -203,6 +203,10 @@ func createNode(tx *gorm.DB, roomID string, node contract.Node, now time.Time) (
 		Metadata: metadata, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := tx.Create(&row).Error; err != nil {
+		// 并发创建同一 ID 时由主键约束兜底，映射回 node_exists 而不是 500。
+		if isDuplicateKeyError(err) {
+			return model.RoomNode{}, contractError(contract.CodeNodeExists, fmt.Sprintf("节点 %s 已存在", node.ID), map[string]any{"nodeId": node.ID})
+		}
 		return model.RoomNode{}, err
 	}
 	return row, nil
@@ -227,13 +231,18 @@ func updateNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time
 	}
 	updated.Version = row.Version + 1
 	updated.UpdatedAt = now
-	if err := tx.Model(&model.RoomNode{}).Where("room_id = ? AND id = ?", roomID, row.ID).
-		Updates(map[string]any{
-			"title": updated.Title, "position_x": updated.PositionX, "position_y": updated.PositionY,
-			"width": updated.Width, "height": updated.Height, "metadata": updated.Metadata,
-			"version": updated.Version, "updated_at": now,
-		}).Error; err != nil {
+	// 数据库条件 CAS：WHERE 带 version=? AND deleted=false，只有行仍处于读取时的
+	// 版本且未被删除才写入，避免并发事务读取同一旧版本后相互覆盖。
+	affected, err := casUpdateNode(tx, roomID, row.ID, row.Version, map[string]any{
+		"title": updated.Title, "position_x": updated.PositionX, "position_y": updated.PositionY,
+		"width": updated.Width, "height": updated.Height, "metadata": updated.Metadata,
+		"version": updated.Version, "updated_at": now,
+	})
+	if err != nil {
 		return model.RoomNode{}, err
+	}
+	if affected == 0 {
+		return model.RoomNode{}, nodeWriteConflict(tx, roomID, row.ID, row)
 	}
 	return updated, nil
 }
@@ -249,9 +258,15 @@ func deleteNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time
 	row.Deleted = true
 	row.Version = row.Version + 1
 	row.UpdatedAt = now
-	if err := tx.Model(&model.RoomNode{}).Where("room_id = ? AND id = ?", roomID, row.ID).
-		Updates(map[string]any{"deleted": true, "version": row.Version, "updated_at": now}).Error; err != nil {
+	// 数据库条件 CAS：仅当版本未变且尚未删除时才标记删除。
+	affected, err := casUpdateNode(tx, roomID, row.ID, row.Version-1, map[string]any{
+		"deleted": true, "version": row.Version, "updated_at": now,
+	})
+	if err != nil {
 		return model.RoomNode{}, err
+	}
+	if affected == 0 {
+		return model.RoomNode{}, nodeWriteConflict(tx, roomID, row.ID, row)
 	}
 	return row, nil
 }
@@ -275,6 +290,10 @@ func connectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Tim
 			Version: 1, CreatedAt: now, UpdatedAt: now,
 		}
 		if err := tx.Create(&row).Error; err != nil {
+			// 并发创建同一连线 ID 时由主键约束兜底。
+			if isDuplicateKeyError(err) {
+				return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线已存在", map[string]any{"edgeId": edge.ID})
+			}
 			return model.RoomEdge{}, err
 		}
 		return row, nil
@@ -285,16 +304,21 @@ func connectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Tim
 	if existing.Deleted || edge.Version == 0 || edge.Version != existing.Version {
 		return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线版本已变化", map[string]any{"edgeId": existing.ID, "version": existing.Version})
 	}
+	expectedVersion := existing.Version
 	existing.FromNodeID = edge.FromNodeID
 	existing.ToNodeID = edge.ToNodeID
-	existing.Version = existing.Version + 1
+	existing.Version = expectedVersion + 1
 	existing.UpdatedAt = now
-	if err := tx.Model(&model.RoomEdge{}).Where("room_id = ? AND id = ?", roomID, existing.ID).
-		Updates(map[string]any{
-			"from_node_id": existing.FromNodeID, "to_node_id": existing.ToNodeID,
-			"version": existing.Version, "updated_at": now,
-		}).Error; err != nil {
+	// 数据库条件 CAS：WHERE 带 version=? AND deleted=false，防止并发覆盖连线修改。
+	affected, err := casUpdateEdge(tx, roomID, existing.ID, expectedVersion, map[string]any{
+		"from_node_id": existing.FromNodeID, "to_node_id": existing.ToNodeID,
+		"version": existing.Version, "updated_at": now,
+	})
+	if err != nil {
 		return model.RoomEdge{}, err
+	}
+	if affected == 0 {
+		return model.RoomEdge{}, edgeWriteConflict(tx, roomID, existing.ID)
 	}
 	return existing, nil
 }
@@ -314,12 +338,19 @@ func disconnectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.
 	if op.Version == nil || *op.Version != row.Version {
 		return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线版本已变化", map[string]any{"edgeId": row.ID, "version": row.Version})
 	}
+	expectedVersion := row.Version
 	row.Deleted = true
-	row.Version = row.Version + 1
+	row.Version = expectedVersion + 1
 	row.UpdatedAt = now
-	if err := tx.Model(&model.RoomEdge{}).Where("room_id = ? AND id = ?", roomID, row.ID).
-		Updates(map[string]any{"deleted": true, "version": row.Version, "updated_at": now}).Error; err != nil {
+	// 数据库条件 CAS：仅当版本未变且尚未删除时才标记删除。
+	affected, err := casUpdateEdge(tx, roomID, row.ID, expectedVersion, map[string]any{
+		"deleted": true, "version": row.Version, "updated_at": now,
+	})
+	if err != nil {
 		return model.RoomEdge{}, err
+	}
+	if affected == 0 {
+		return model.RoomEdge{}, edgeWriteConflict(tx, roomID, row.ID)
 	}
 	return row, nil
 }
@@ -371,6 +402,47 @@ func ensureNodeExists(tx *gorm.DB, roomID, id string) error {
 
 func versionConflict(row model.RoomNode) error {
 	return contractError(contract.CodeVersionConflict, "节点版本已变化", map[string]any{"node": rowToContractNode(row)})
+}
+
+// casUpdateNode 是节点的数据库条件 CAS：仅当 (room_id,id) 行仍处于 expectedVersion
+// 且 deleted=false 时更新，返回受影响行数。0 行表示版本已被并发修改或删除。
+func casUpdateNode(tx *gorm.DB, roomID, id string, expectedVersion int, values map[string]any) (int64, error) {
+	result := tx.Model(&model.RoomNode{}).
+		Where("room_id = ? AND id = ? AND version = ? AND deleted = ?", roomID, id, expectedVersion, false).
+		Updates(values)
+	return result.RowsAffected, result.Error
+}
+
+// casUpdateEdge 是连线的数据库条件 CAS，语义同 casUpdateNode。
+func casUpdateEdge(tx *gorm.DB, roomID, id string, expectedVersion int, values map[string]any) (int64, error) {
+	result := tx.Model(&model.RoomEdge{}).
+		Where("room_id = ? AND id = ? AND version = ? AND deleted = ?", roomID, id, expectedVersion, false).
+		Updates(values)
+	return result.RowsAffected, result.Error
+}
+
+// nodeWriteConflict 在 CAS 影响 0 行时构造冲突错误：重读当前行，若已被删除返回
+// node_deleted，否则返回 version_conflict 并携带最新节点，绝不上报成功。
+func nodeWriteConflict(tx *gorm.DB, roomID, id string, fallback model.RoomNode) error {
+	var current model.RoomNode
+	if err := tx.First(&current, "room_id = ? AND id = ?", roomID, id).Error; err == nil {
+		if current.Deleted {
+			return contractError(contract.CodeNodeDeleted, fmt.Sprintf("节点 %s 已被删除", id), map[string]any{"nodeId": id, "deleted": true})
+		}
+		return versionConflict(current)
+	}
+	return versionConflict(fallback)
+}
+
+// edgeWriteConflict 在连线 CAS 影响 0 行时构造 edge_changed 错误，携带最新版本。
+func edgeWriteConflict(tx *gorm.DB, roomID, id string) error {
+	details := map[string]any{"edgeId": id}
+	var current model.RoomEdge
+	if err := tx.First(&current, "room_id = ? AND id = ?", roomID, id).Error; err == nil {
+		details["version"] = current.Version
+		details["deleted"] = current.Deleted
+	}
+	return contractError(contract.CodeEdgeChanged, "连线版本已变化", details)
 }
 
 // applyNodeFields 把 update 的增量字段合并进节点行。字段白名单：
