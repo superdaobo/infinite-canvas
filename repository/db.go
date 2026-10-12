@@ -90,6 +90,7 @@ func DB() (*gorm.DB, error) {
 			&model.RoomNode{},
 			&model.RoomEdge{},
 			&model.RoomOperation{},
+			&model.RoomHistory{},
 			&model.RoomMedia{},
 			&model.SchoolTaskRecord{},
 		)

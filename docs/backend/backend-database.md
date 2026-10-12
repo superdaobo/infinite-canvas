@@ -42,6 +42,7 @@ description: 当前后端主要数据表与字段说明
 - `collab_room_nodes`
 - `collab_room_edges`
 - `collab_room_operations`
+- `collab_room_history`
 - `collab_room_media`
 - `school_tasks`
 
@@ -476,6 +477,30 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 | `created_at` | datetime | 时间戳 |
 
 节点/连线/回执在同一事务内写入，房间 `revision` 恰好 +1；任一操作失败整批回滚。
+
+
+### collab_room_history
+
+协作房间操作历史表（协作 v1，C01-06 #11）。一次成功批次（`operationId`）对应一行，逐目标记录操作前后的行快照与版本，既用于审计（谁、何时、对哪个房间做了什么、前后版本），也用于撤销/重做。与节点/连线/幂等回执在**同一事务**内写入，因此不存在“已改图但无历史”的窗口。
+
+撤销/重做按用户隔离：只有 `actor_id` 本人且仍是可写成员才能操作。撤销/重做把每个目标在 `before`/`after` 状态之间切换，切换时以行 `version` 做条件 CAS；若目标已被他人修改（版本前进），整条历史失效并返回 `version_conflict`（`reason=history_invalidated`），绝不覆盖他人修改。连续拖动（单条仅改坐标的 `update`）会合并进上一条同类历史并累计 `merged`。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 历史记录 ID，主键 |
+| `room_id` | string | 房间 ID |
+| `operation_id` | string | 产生该历史的批次 operationId（幂等键） |
+| `actor_id` | string | 操作者用户 ID（撤销/重做的隔离依据） |
+| `revision` | number | 该批次提交后的房间 revision（审计与合并判定用；撤销/重做不改写） |
+| `summary` | string | 人类可读变更摘要 |
+| `ops_json` | text | 逐目标明细 JSON：op/target/id/before/after/active/version/merged |
+| `status` | string | `applied`（变更在图中）/ `undone`（已被本人撤销） |
+| `undone_by` | string | 撤销该历史的批次 operationId（`undo_<historyId>`） |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_history_room_revision (room_id, revision)`、`idx_collab_room_history_actor (actor_id)`
+
+与 `collab_room_nodes`/`collab_room_edges`/`collab_room_operations` 一致，当前删除房间的级联只清理成员、邀请与媒体，不清理历史（历史保留用于审计）。
 
 
 ### collab_room_media
