@@ -139,6 +139,16 @@ func New() *gin.Engine {
 	v1.POST("/collab/invites/accept", gin.WrapF(handler.CollabAcceptInvite))
 	v1.POST("/collab/rooms/:id/operations", func(c *gin.Context) { handler.CollabApplyOperations(c.Writer, c.Request, c.Param("id")) })
 	v1.GET("/collab/rooms/:id/graph", func(c *gin.Context) { handler.CollabRoomGraph(c.Writer, c.Request, c.Param("id")) })
+	// 协作历史审计与撤销/重做（C01-06 #11）：均按房间成员鉴权，撤销按用户隔离。
+	v1.GET("/collab/rooms/:id/history", func(c *gin.Context) {
+		handler.CollabRoomHistory(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.POST("/collab/rooms/:id/history/:historyId/undo", func(c *gin.Context) {
+		handler.CollabUndoRoomHistory(c.Writer, c.Request, c.Param("id"), c.Param("historyId"))
+	})
+	v1.POST("/collab/rooms/:id/history/:historyId/redo", func(c *gin.Context) {
+		handler.CollabRedoRoomHistory(c.Writer, c.Request, c.Param("id"), c.Param("historyId"))
+	})
 	v1.POST("/collab/rooms/:id/ws-ticket", func(c *gin.Context) {
 		handler.CollabCreateWSTicket(c.Writer, c.Request, c.Param("id"))
 	})

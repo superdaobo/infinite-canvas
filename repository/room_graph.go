@@ -66,7 +66,7 @@ func ApplyRoomBatch(roomID, userID, operationID, digest string, ops []contract.O
 			return err
 		}
 
-		changes, err := applyOperations(tx, roomID, ops)
+		changes, historyOps, err := applyOperations(tx, roomID, ops)
 		if err != nil {
 			return err
 		}
@@ -86,7 +86,7 @@ func ApplyRoomBatch(roomID, userID, operationID, digest string, ops []contract.O
 		if err != nil {
 			return err
 		}
-		return tx.Create(&model.RoomOperation{
+		if err := tx.Create(&model.RoomOperation{
 			RoomID:        roomID,
 			UserID:        userID,
 			OperationID:   operationID,
@@ -94,7 +94,11 @@ func ApplyRoomBatch(roomID, userID, operationID, digest string, ops []contract.O
 			Revision:      refreshed.Revision,
 			ResponseJSON:  string(payload),
 			CreatedAt:     now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		// 审计：同一事务内记录本次批次的逐目标变更（含前后版本与快照），供审计与撤销使用。
+		return writeRoomHistory(tx, roomID, userID, operationID, refreshed.Revision, historyOps, now)
 	})
 	if txErr != nil {
 		return model.RoomBatchResult{}, txErr
@@ -138,49 +142,99 @@ func ListRoomGraph(roomID string) ([]model.RoomNode, []model.RoomEdge, error) {
 }
 
 // applyOperations 按顺序应用批次内每个操作，随后对整张房间图做一致性校验。
-func applyOperations(tx *gorm.DB, roomID string, ops []contract.Operation) ([]model.RoomChange, error) {
+// 同时返回逐目标的历史明细（含操作前后行快照与版本），供同一事务内写审计与撤销依据。
+func applyOperations(tx *gorm.DB, roomID string, ops []contract.Operation) ([]model.RoomChange, []model.RoomHistoryOp, error) {
 	now := time.Now().UTC()
 	changes := make([]model.RoomChange, 0, len(ops))
+	history := make([]model.RoomHistoryOp, 0, len(ops))
 	for _, op := range ops {
 		switch op.Type {
 		case contract.OpCreate:
 			node, err := createNode(tx, roomID, *op.Node, now)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			changes = append(changes, model.RoomChange{Type: "upsert", Node: &node})
+			history = append(history, model.RoomHistoryOp{
+				Op: "create", Target: "node", ID: node.ID,
+				After: nodeState(node), Active: true, Version: node.Version,
+			})
 		case contract.OpUpdate:
-			node, err := updateNode(tx, roomID, op, now)
+			node, before, err := updateNode(tx, roomID, op, now)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			changes = append(changes, model.RoomChange{Type: "upsert", Node: &node})
+			history = append(history, model.RoomHistoryOp{
+				Op: "update", Target: "node", ID: node.ID,
+				Before: nodeState(before), After: nodeState(node), Active: true, Version: node.Version,
+				PositionOnly: positionOnlyFields(op.Fields),
+			})
 		case contract.OpDelete:
-			node, err := deleteNode(tx, roomID, op, now)
+			node, before, err := deleteNode(tx, roomID, op, now)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			changes = append(changes, model.RoomChange{Type: "delete", Node: &node})
+			history = append(history, model.RoomHistoryOp{
+				Op: "delete", Target: "node", ID: node.ID,
+				Before: nodeState(before), After: nodeState(node), Active: true, Version: node.Version,
+			})
 		case contract.OpConnect:
-			edge, err := connectEdge(tx, roomID, op, now)
+			edge, before, err := connectEdge(tx, roomID, op, now)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			changes = append(changes, model.RoomChange{Type: "edge-upsert", Edge: &edge})
+			history = append(history, model.RoomHistoryOp{
+				Op: "connect", Target: "edge", ID: edge.ID,
+				Before: edgeStatePtr(before), After: edgeState(edge), Active: true, Version: edge.Version,
+			})
 		case contract.OpDisconnect:
-			edge, err := disconnectEdge(tx, roomID, op, now)
+			edge, before, err := disconnectEdge(tx, roomID, op, now)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			changes = append(changes, model.RoomChange{Type: "edge-delete", Edge: &edge})
+			history = append(history, model.RoomHistoryOp{
+				Op: "disconnect", Target: "edge", ID: edge.ID,
+				Before: edgeState(before), After: edgeState(edge), Active: true, Version: edge.Version,
+			})
 		default:
-			return nil, contractError(contract.CodeInvalidPayload, fmt.Sprintf("未知操作类型 %q", op.Type), nil)
+			return nil, nil, contractError(contract.CodeInvalidPayload, fmt.Sprintf("未知操作类型 %q", op.Type), nil)
 		}
 	}
 	if err := validateRoomGraph(tx, roomID); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return changes, nil
+	return changes, history, nil
+}
+
+// positionOnlyFields 判断一次 update 是否只修改了坐标（连续拖动合并的判定条件）。
+func positionOnlyFields(fields map[string]any) bool {
+	if len(fields) != 1 {
+		return false
+	}
+	_, ok := fields["position"]
+	return ok
+}
+
+func nodeState(row model.RoomNode) *model.RoomHistoryState {
+	copied := row
+	return &model.RoomHistoryState{Node: &copied}
+}
+
+func edgeState(row model.RoomEdge) *model.RoomHistoryState {
+	copied := row
+	return &model.RoomHistoryState{Edge: &copied}
+}
+
+// edgeStatePtr 在连线此前不存在（connect 新建）时返回 nil，表示 Before 状态为“不存在”。
+func edgeStatePtr(row *model.RoomEdge) *model.RoomHistoryState {
+	if row == nil {
+		return nil
+	}
+	return edgeState(*row)
 }
 
 func createNode(tx *gorm.DB, roomID string, node contract.Node, now time.Time) (model.RoomNode, error) {
@@ -212,22 +266,24 @@ func createNode(tx *gorm.DB, roomID string, node contract.Node, now time.Time) (
 	return row, nil
 }
 
-func updateNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomNode, error) {
+// updateNode 更新节点并返回 (更新后的行, 更新前的行快照, error)。
+func updateNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomNode, model.RoomNode, error) {
 	row, err := loadNodeForWrite(tx, roomID, op.ID)
 	if err != nil {
-		return model.RoomNode{}, err
+		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	if op.Version == nil || *op.Version != row.Version {
-		return model.RoomNode{}, versionConflict(row)
+		return model.RoomNode{}, model.RoomNode{}, versionConflict(row)
 	}
+	before := row
 	updated, err := applyNodeFields(row, op.Fields)
 	if err != nil {
-		return model.RoomNode{}, err
+		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	// 增量更新后的结果必须仍是合法节点（例如 text/config 必填 content 不能丢）。
 	candidate := rowToContractNode(updated)
 	if err := contract.ValidateNode(&candidate); err != nil {
-		return model.RoomNode{}, err
+		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	updated.Version = row.Version + 1
 	updated.UpdatedAt = now
@@ -239,22 +295,24 @@ func updateNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time
 		"version": updated.Version, "updated_at": now,
 	})
 	if err != nil {
-		return model.RoomNode{}, err
+		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	if affected == 0 {
-		return model.RoomNode{}, nodeWriteConflict(tx, roomID, row.ID, row)
+		return model.RoomNode{}, model.RoomNode{}, nodeWriteConflict(tx, roomID, row.ID, row)
 	}
-	return updated, nil
+	return updated, before, nil
 }
 
-func deleteNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomNode, error) {
+// deleteNode 软删除节点并返回 (删除后的墓碑行, 删除前的行快照, error)。
+func deleteNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomNode, model.RoomNode, error) {
 	row, err := loadNodeForWrite(tx, roomID, op.ID)
 	if err != nil {
-		return model.RoomNode{}, err
+		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	if op.Version == nil || *op.Version != row.Version {
-		return model.RoomNode{}, versionConflict(row)
+		return model.RoomNode{}, model.RoomNode{}, versionConflict(row)
 	}
+	before := row
 	row.Deleted = true
 	row.Version = row.Version + 1
 	row.UpdatedAt = now
@@ -263,27 +321,28 @@ func deleteNode(tx *gorm.DB, roomID string, op contract.Operation, now time.Time
 		"deleted": true, "version": row.Version, "updated_at": now,
 	})
 	if err != nil {
-		return model.RoomNode{}, err
+		return model.RoomNode{}, model.RoomNode{}, err
 	}
 	if affected == 0 {
-		return model.RoomNode{}, nodeWriteConflict(tx, roomID, row.ID, row)
+		return model.RoomNode{}, model.RoomNode{}, nodeWriteConflict(tx, roomID, row.ID, row)
 	}
-	return row, nil
+	return row, before, nil
 }
 
-func connectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomEdge, error) {
+// connectEdge 新建或更新连线并返回 (结果行, 更新前的行快照或 nil（新建）, error)。
+func connectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomEdge, *model.RoomEdge, error) {
 	edge := *op.Edge
 	if err := ensureNodeExists(tx, roomID, edge.FromNodeID); err != nil {
-		return model.RoomEdge{}, err
+		return model.RoomEdge{}, nil, err
 	}
 	if err := ensureNodeExists(tx, roomID, edge.ToNodeID); err != nil {
-		return model.RoomEdge{}, err
+		return model.RoomEdge{}, nil, err
 	}
 	var existing model.RoomEdge
 	err := tx.First(&existing, "room_id = ? AND id = ?", roomID, edge.ID).Error
 	if err == gorm.ErrRecordNotFound {
 		if edge.Version != 0 {
-			return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线不存在，无法按指定版本更新", map[string]any{"edgeId": edge.ID})
+			return model.RoomEdge{}, nil, contractError(contract.CodeEdgeChanged, "连线不存在，无法按指定版本更新", map[string]any{"edgeId": edge.ID})
 		}
 		row := model.RoomEdge{
 			RoomID: roomID, ID: edge.ID, FromNodeID: edge.FromNodeID, ToNodeID: edge.ToNodeID,
@@ -292,18 +351,19 @@ func connectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Tim
 		if err := tx.Create(&row).Error; err != nil {
 			// 并发创建同一连线 ID 时由主键约束兜底。
 			if isDuplicateKeyError(err) {
-				return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线已存在", map[string]any{"edgeId": edge.ID})
+				return model.RoomEdge{}, nil, contractError(contract.CodeEdgeChanged, "连线已存在", map[string]any{"edgeId": edge.ID})
 			}
-			return model.RoomEdge{}, err
+			return model.RoomEdge{}, nil, err
 		}
-		return row, nil
+		return row, nil, nil
 	}
 	if err != nil {
-		return model.RoomEdge{}, err
+		return model.RoomEdge{}, nil, err
 	}
 	if existing.Deleted || edge.Version == 0 || edge.Version != existing.Version {
-		return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线版本已变化", map[string]any{"edgeId": existing.ID, "version": existing.Version})
+		return model.RoomEdge{}, nil, contractError(contract.CodeEdgeChanged, "连线版本已变化", map[string]any{"edgeId": existing.ID, "version": existing.Version})
 	}
+	before := existing
 	expectedVersion := existing.Version
 	existing.FromNodeID = edge.FromNodeID
 	existing.ToNodeID = edge.ToNodeID
@@ -315,29 +375,31 @@ func connectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Tim
 		"version": existing.Version, "updated_at": now,
 	})
 	if err != nil {
-		return model.RoomEdge{}, err
+		return model.RoomEdge{}, nil, err
 	}
 	if affected == 0 {
-		return model.RoomEdge{}, edgeWriteConflict(tx, roomID, existing.ID)
+		return model.RoomEdge{}, nil, edgeWriteConflict(tx, roomID, existing.ID)
 	}
-	return existing, nil
+	return existing, &before, nil
 }
 
-func disconnectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomEdge, error) {
+// disconnectEdge 软删除连线并返回 (删除后的墓碑行, 删除前的行快照, error)。
+func disconnectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.Time) (model.RoomEdge, model.RoomEdge, error) {
 	var row model.RoomEdge
 	err := tx.First(&row, "room_id = ? AND id = ?", roomID, op.ID).Error
 	if err == gorm.ErrRecordNotFound {
-		return model.RoomEdge{}, contractError(contract.CodeNotFound, fmt.Sprintf("连线 %s 不存在", op.ID), map[string]any{"edgeId": op.ID})
+		return model.RoomEdge{}, model.RoomEdge{}, contractError(contract.CodeNotFound, fmt.Sprintf("连线 %s 不存在", op.ID), map[string]any{"edgeId": op.ID})
 	}
 	if err != nil {
-		return model.RoomEdge{}, err
+		return model.RoomEdge{}, model.RoomEdge{}, err
 	}
 	if row.Deleted {
-		return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, fmt.Sprintf("连线 %s 已被删除", op.ID), map[string]any{"edgeId": op.ID})
+		return model.RoomEdge{}, model.RoomEdge{}, contractError(contract.CodeEdgeChanged, fmt.Sprintf("连线 %s 已被删除", op.ID), map[string]any{"edgeId": op.ID})
 	}
 	if op.Version == nil || *op.Version != row.Version {
-		return model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线版本已变化", map[string]any{"edgeId": row.ID, "version": row.Version})
+		return model.RoomEdge{}, model.RoomEdge{}, contractError(contract.CodeEdgeChanged, "连线版本已变化", map[string]any{"edgeId": row.ID, "version": row.Version})
 	}
+	before := row
 	expectedVersion := row.Version
 	row.Deleted = true
 	row.Version = expectedVersion + 1
@@ -347,12 +409,12 @@ func disconnectEdge(tx *gorm.DB, roomID string, op contract.Operation, now time.
 		"deleted": true, "version": row.Version, "updated_at": now,
 	})
 	if err != nil {
-		return model.RoomEdge{}, err
+		return model.RoomEdge{}, model.RoomEdge{}, err
 	}
 	if affected == 0 {
-		return model.RoomEdge{}, edgeWriteConflict(tx, roomID, row.ID)
+		return model.RoomEdge{}, model.RoomEdge{}, edgeWriteConflict(tx, roomID, row.ID)
 	}
-	return row, nil
+	return row, before, nil
 }
 
 // validateRoomGraph 用契约校验整张房间图：端点存在、无自环、无重复连线、无环。

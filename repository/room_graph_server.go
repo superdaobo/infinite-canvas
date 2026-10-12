@@ -60,7 +60,7 @@ func ApplyRoomBatchAsServer(roomID, actorID, operationID, digest string, ops []c
 			return err
 		}
 
-		changes, err := applyOperations(tx, roomID, ops)
+		changes, historyOps, err := applyOperations(tx, roomID, ops)
 		if err != nil {
 			return err
 		}
@@ -80,7 +80,7 @@ func ApplyRoomBatchAsServer(roomID, actorID, operationID, digest string, ops []c
 		if err != nil {
 			return err
 		}
-		return tx.Create(&model.RoomOperation{
+		if err := tx.Create(&model.RoomOperation{
 			RoomID:        roomID,
 			UserID:        actorID,
 			OperationID:   operationID,
@@ -88,7 +88,11 @@ func ApplyRoomBatchAsServer(roomID, actorID, operationID, digest string, ops []c
 			Revision:      refreshed.Revision,
 			ResponseJSON:  string(payload),
 			CreatedAt:     now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		// 服务端回填同样写入审计历史（actor 为任务提交人，不据此授予写权限）。
+		return writeRoomHistory(tx, roomID, actorID, operationID, refreshed.Revision, historyOps, now)
 	})
 	if txErr != nil {
 		return model.RoomBatchResult{}, txErr
