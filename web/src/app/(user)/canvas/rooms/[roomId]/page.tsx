@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { AlertTriangle, ChevronLeft, Loader2, MousePointer2, Plus, RefreshCw, Trash2, Users, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, ChevronLeft, Loader2, MousePointer2, Plus, RefreshCw, Share2, Trash2, Users, Wifi, WifiOff } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import type { CollabCursorInfo } from "@/services/api/collab-realtime";
@@ -12,6 +12,8 @@ import { ConnectionPath } from "../../components/canvas-connections";
 import { InfiniteCanvas } from "../../components/infinite-canvas";
 import { isSharedCanvasEnabled } from "../../mode";
 import type { Position, ViewportTransform } from "../../types";
+import { CollabSharingPanel } from "../collab-sharing-panel";
+import { useCollabInviteJoin } from "../use-collab-invite-join";
 import { useCollabRoomEditing } from "../use-collab-room-editing";
 import { useCollabRoomRealtime, type CollabRealtimeStatus } from "../use-collab-room-realtime";
 
@@ -99,6 +101,9 @@ export default function CollabRoomPage() {
     });
     const colorTheme = useThemeStore((state) => state.theme);
     const theme = canvasThemes[colorTheme];
+    // 邀请链接加入（#16）：读取 fragment 令牌，未登录先登录，登录后自动 accept。
+    const { joining, joinError } = useCollabInviteJoin(params.roomId, sharedEnabled);
+    const [sharingOpen, setSharingOpen] = useState(false);
     const containerRef = useRef<HTMLDivElement>(null);
     const didCenterRef = useRef(false);
     const [viewport, setViewport] = useState<ViewportTransform>({ x: 0, y: 0, k: 1 });
@@ -304,6 +309,17 @@ export default function CollabRoomPage() {
                     <span className="font-medium">在线 {members.length}</span>
                     {members.length ? <span className="max-w-[200px] truncate text-xs opacity-70">{members.map((member) => member.username).join("、")}</span> : null}
                 </div>
+                {room ? (
+                    <button
+                        type="button"
+                        onClick={() => setSharingOpen(true)}
+                        className="flex h-9 items-center gap-1 rounded-lg border px-3 text-sm font-medium backdrop-blur transition hover:opacity-80"
+                        style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
+                    >
+                        <Share2 className="size-4" />
+                        成员与分享
+                    </button>
+                ) : null}
                 <div
                     className="flex h-9 items-center gap-1 rounded-lg border px-3 text-xs backdrop-blur"
                     style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: realtimeStatus === "revoked" ? "#ef4444" : theme.node.text }}
@@ -454,6 +470,23 @@ export default function CollabRoomPage() {
             ) : !nodes.length ? (
                 <div className="pointer-events-none absolute inset-0 z-[90] grid place-items-center text-sm opacity-60">这个共享画布还没有内容</div>
             ) : null}
+
+            {joining ? (
+                <div className="pointer-events-none absolute inset-0 z-[95] grid place-items-center">
+                    <span className="flex items-center gap-2 rounded-lg border px-5 py-3 text-sm backdrop-blur" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}>
+                        <Loader2 className="size-4 animate-spin" />
+                        正在加入共享画布...
+                    </span>
+                </div>
+            ) : joinError ? (
+                <div className="pointer-events-none absolute inset-x-0 top-16 z-[95] grid place-items-center">
+                    <div className="rounded-lg border px-5 py-3 text-sm" style={{ background: theme.toolbar.panel, borderColor: "#ef4444", color: "#ef4444" }}>
+                        {joinError}
+                    </div>
+                </div>
+            ) : null}
+
+            {room ? <CollabSharingPanel room={room} open={sharingOpen} onClose={() => setSharingOpen(false)} /> : null}
         </main>
     );
 }
