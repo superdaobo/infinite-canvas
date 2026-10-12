@@ -112,7 +112,11 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
     // - 本地未确认草稿（dirty）目标优先，远端不覆盖、不删除，草稿不丢；
     // - 本地待删除目标不因远端 upsert 复活，但同步服务端版本让删除命中正确版本；
     // - 其余目标按 id 幂等 upsert/delete，并用服务端 version 去重，重复事件不重复创建内容。
-    function applyRemoteChanges(changes: CollabChangeView[]) {
+    function applyRemoteChanges(changes: CollabChangeView[], revision?: number) {
+        // 服务端 changes 事件携带提交后的 revision；必须据此推进本地 revision，
+        // 否则仅收到他人变更而不自己提交的连接会一直停留在旧 revision（例如断线重连后
+        // 由增量补发追平的客户端），导致 revision 显示与房间不一致。
+        if (typeof revision === "number") setRevision((current) => (revision > current ? revision : current));
         if (!changes.length) return;
         let nextNodes = nodesRef.current;
         let nextConnections = connectionsRef.current;
