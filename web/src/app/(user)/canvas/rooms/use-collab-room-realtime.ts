@@ -253,6 +253,34 @@ export function useCollabRoomRealtime(roomId: string, enabled: boolean, revision
             void connect();
         }
 
+        // 浏览器离线：Chromium 的离线模拟不会关闭已建立的 WebSocket，socket 仍是 OPEN
+        // 但已收不到广播。这里显式把状态置为「离线」，让用户知道当前视图可能不是最新。
+        function handleOffline() {
+            if (disposed || fatalRef.current) return;
+            setStatus("offline");
+        }
+
+        // 恢复联网：即使 socket 仍为 OPEN 也要强制重连并按 revision 重新对齐，
+        // 否则离线期间错过的 changes 会让本地状态一直陈旧。
+        function handleOnline() {
+            if (disposed || fatalRef.current) return;
+            reconnectAttemptRef.current = 0;
+            clearReconnectTimer();
+            const stale = socketRef.current;
+            if (stale) {
+                socketRef.current = null;
+                stale.onclose = null;
+                stale.onmessage = null;
+                stale.onerror = null;
+                try {
+                    stale.close();
+                } catch {
+                    // 关闭异常可忽略：下面的 connect() 会建立新连接。
+                }
+            }
+            void connect();
+        }
+
         const pruneTimer = setInterval(() => {
             const now = Date.now();
             let changed = false;
@@ -266,7 +294,8 @@ export function useCollabRoomRealtime(roomId: string, enabled: boolean, revision
         }, CURSOR_PRUNE_INTERVAL_MS);
 
         document.addEventListener("visibilitychange", handleResume);
-        window.addEventListener("online", handleResume);
+        window.addEventListener("online", handleOnline);
+        window.addEventListener("offline", handleOffline);
         void connect();
 
         return () => {
@@ -274,7 +303,8 @@ export function useCollabRoomRealtime(roomId: string, enabled: boolean, revision
             clearReconnectTimer();
             clearInterval(pruneTimer);
             document.removeEventListener("visibilitychange", handleResume);
-            window.removeEventListener("online", handleResume);
+            window.removeEventListener("online", handleOnline);
+            window.removeEventListener("offline", handleOffline);
             const socket = socketRef.current;
             socketRef.current = null;
             if (socket) {
