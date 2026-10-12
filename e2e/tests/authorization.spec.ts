@@ -85,7 +85,8 @@ test.describe("权限：viewer 只读与未授权负例", () => {
         const outsiderPage = await outsiderContext.newPage();
         await gotoRoom(outsiderPage, room.id);
 
-        await expect(outsiderPage.getByText("房间不存在")).toBeVisible({ timeout: 15_000 });
+        // 页面会同时渲染载入错误与房间错误卡片，用 exact 匹配避免 strict mode 命中多个元素。
+        await expect(outsiderPage.getByText("房间不存在", { exact: true })).toBeVisible({ timeout: 15_000 });
         expect(await roomNodeIds(outsiderPage)).toHaveLength(0);
         await expect(outsiderPage.locator(`[data-node-id="${seededNodeId}"]`)).toHaveCount(0);
 

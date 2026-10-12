@@ -89,9 +89,10 @@ test.describe("协作：双账号实时同编与冲突", () => {
         const concurrent = await apiUpdateNode(request, owner, room.id, nodeId, 1, { title: "owner-concurrent" });
         expect(concurrent.status, `owner 并发写入应成功：${JSON.stringify(concurrent.body)}`).toBe(200);
 
-        // 后写（editor 的过期版本写入）被拒：UI 暴露 version_conflict 且草稿保留。
-        await expect(editorPage.getByText(/version_conflict/)).toBeVisible({ timeout: 20_000 });
-        await expect(editorPage.getByText(/草稿已保留/)).toBeVisible();
+        // 后写（editor 的过期版本写入）被拒：UI 暴露冲突提示且草稿保留。
+        // #15 起冲突以中文浮层呈现（不再回显 version_conflict 字面量），并给出两种处理方式。
+        await expect(editorPage.getByText("保留本地草稿并重试")).toBeVisible({ timeout: 20_000 });
+        await expect(editorPage.getByText("你的草稿已保留，不会被静默丢弃。")).toBeVisible();
 
         // 草稿不丢：退出编辑后本地仍显示 editor 的草稿内容（未被服务端回滚清空）。
         await stopEditingNode(editorPage);
