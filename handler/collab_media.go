@@ -90,14 +90,19 @@ func serveCollabRoomMedia(w http.ResponseWriter, r *http.Request, roomID, mediaI
 	}
 	defer file.Close()
 
-	if media.MimeType != "" {
-		w.Header().Set("Content-Type", media.MimeType)
-	}
-	if download {
-		w.Header().Set("Content-Disposition", contentDispositionAttachment(media.Filename))
-	}
+	// 一律禁止浏览器对响应做 MIME 嗅探，避免把非内联安全内容当成 HTML/脚本执行。
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// 房间媒体是私有的，禁止共享缓存。
 	w.Header().Set("Cache-Control", "private, no-store")
+
+	// Content-Type 只能使用上传时校验通过并存下来的类型，绝不回显客户端声明值；
+	// 非内联安全类型（含历史遗留的 image/svg+xml、text/html 等主动内容）强制附件下载，
+	// 并使用通用二进制类型，确保不会在同源被当作可执行内容内联渲染。
+	inlineSafe := service.RoomMediaInlineSafe(media.MimeType)
+	w.Header().Set("Content-Type", service.RoomMediaResponseContentType(media.MimeType))
+	if download || !inlineSafe {
+		w.Header().Set("Content-Disposition", contentDispositionAttachment(media.Filename))
+	}
 	// ServeContent 处理 Range/If-Range/If-Modified-Since 并正确返回 206 与 Content-Range。
 	http.ServeContent(w, r, media.Filename, media.CreatedAt, file)
 }

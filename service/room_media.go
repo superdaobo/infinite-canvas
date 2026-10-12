@@ -283,33 +283,87 @@ func normalizeRoomMediaFilename(filename string) string {
 	return name
 }
 
-// classifyRoomMedia 依据声明的 Content-Type 与内容嗅探结果判定媒体类别。
-// 只要声明类型或嗅探类型之一属于图片/视频/音频即通过，否则视为不支持。
-func classifyRoomMedia(declared string, header []byte) (model.RoomMediaKind, string, bool) {
-	candidates := make([]string, 0, 2)
-	if ct := cleanMimeType(declared); ct != "" {
-		candidates = append(candidates, ct)
-	}
-	candidates = append(candidates, cleanMimeType(http.DetectContentType(header)))
-	for _, ct := range candidates {
-		if kind, ok := roomMediaKindForMime(ct); ok {
-			return kind, ct, true
-		}
-	}
-	return "", "", false
+// safeRoomMediaMimeKinds 是房间共享媒体唯一允许的显式安全类型白名单（精确匹配）。
+// 只放可被浏览器当作惰性二进制/媒体资源渲染、不含脚本执行能力的类型；
+// image/svg+xml、text/html、text/xml、application/xhtml+xml 等主动内容一律不在内。
+var safeRoomMediaMimeKinds = map[string]model.RoomMediaKind{
+	"image/png":  model.RoomMediaKindImage,
+	"image/jpeg": model.RoomMediaKindImage,
+	"image/webp": model.RoomMediaKindImage,
+	"image/gif":  model.RoomMediaKindImage,
+
+	"video/mp4":  model.RoomMediaKindVideo,
+	"video/webm": model.RoomMediaKindVideo,
+
+	"audio/mpeg":  model.RoomMediaKindAudio,
+	"audio/wav":   model.RoomMediaKindAudio,
+	"audio/x-wav": model.RoomMediaKindAudio,
+	"audio/wave":  model.RoomMediaKindAudio,
+	"audio/ogg":   model.RoomMediaKindAudio,
+	"audio/mp4":   model.RoomMediaKindAudio,
+	"audio/webm":  model.RoomMediaKindAudio,
 }
 
-func roomMediaKindForMime(mimeType string) (model.RoomMediaKind, bool) {
-	switch {
-	case strings.HasPrefix(mimeType, "image/"):
-		return model.RoomMediaKindImage, true
-	case strings.HasPrefix(mimeType, "video/"):
-		return model.RoomMediaKindVideo, true
-	case strings.HasPrefix(mimeType, "audio/"):
-		return model.RoomMediaKindAudio, true
-	default:
-		return "", false
+// activeContentMimeTypes 是绝不允许作为房间媒体落库的主动内容类型。
+// 这些类型在同源内联返回时可在成员浏览器中执行脚本，是本次加固的核心拒绝面。
+var activeContentMimeTypes = map[string]bool{
+	"image/svg+xml":            true,
+	"text/html":                true,
+	"text/xml":                 true,
+	"application/xml":          true,
+	"application/xhtml+xml":    true,
+	"application/javascript":   true,
+	"text/javascript":          true,
+	"application/ecmascript":   true,
+	"text/ecmascript":          true,
+	"application/x-javascript": true,
+	"application/xhtml":        true,
+}
+
+// RoomMediaInlineSafe 判断已存储的媒体类型是否可以安全地同源内联渲染。
+// 非白名单类型（含历史遗留的 image/svg+xml、text/html 等主动内容）一律返回 false，
+// 调用方应强制附件下载并使用通用二进制类型。
+func RoomMediaInlineSafe(mimeType string) bool {
+	_, ok := safeRoomMediaMimeKinds[cleanMimeType(mimeType)]
+	return ok
+}
+
+// RoomMediaResponseContentType 返回响应应使用的 Content-Type：只接受上传时校验通过的
+// 内联安全白名单类型，其余（历史遗留主动内容或未知类型）一律回退为通用二进制类型。
+// 绝不回显客户端在上传时声明的原始值。
+func RoomMediaResponseContentType(mimeType string) string {
+	if ct := cleanMimeType(mimeType); RoomMediaInlineSafe(ct) {
+		return ct
 	}
+	return "application/octet-stream"
+}
+
+// classifyRoomMedia 依据声明类型与内容嗅探结果判定媒体类别，返回落库使用的类型。
+//
+// 判定策略（拒绝客户端自报类型绕过）：
+//  1. 声明类型与嗅探类型只要命中主动内容（SVG/HTML/XML/JS）直接拒绝；
+//  2. 声明类型必须精确落在安全白名单内，任意 image/* 不再放行；
+//  3. 图片必须由内容嗅探确认为白名单图片类型，杜绝把 SVG/HTML 文本伪装成图片；
+//     视频/音频容器 Go 无法可靠嗅探，仅要求声明在白名单且内容非主动内容。
+//
+// 返回的 mimeType 始终是白名单内的类型，即上传时校验通过并存下来的类型。
+func classifyRoomMedia(declared string, header []byte) (model.RoomMediaKind, string, bool) {
+	declared = cleanMimeType(declared)
+	sniffed := cleanMimeType(http.DetectContentType(header))
+	if activeContentMimeTypes[declared] || activeContentMimeTypes[sniffed] {
+		return "", "", false
+	}
+	kind, ok := safeRoomMediaMimeKinds[declared]
+	if !ok {
+		return "", "", false
+	}
+	if kind == model.RoomMediaKindImage {
+		sniffKind, sniffOK := safeRoomMediaMimeKinds[sniffed]
+		if !sniffOK || sniffKind != model.RoomMediaKindImage {
+			return "", "", false
+		}
+	}
+	return kind, declared, true
 }
 
 func cleanMimeType(value string) string {
