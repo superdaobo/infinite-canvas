@@ -36,7 +36,9 @@ export default defineConfig({
     ],
     webServer: [
         {
-            command: "go run .",
+            // 先编译成独立二进制再运行：`go run .` 会派生子进程，Playwright 终止 webServer
+            // 时子进程会残留并占住端口，导致收尾阶段挂起。独立二进制是单进程，可干净退出。
+            command: "go build -o e2e/e2e-backend.exe . && e2e\\e2e-backend.exe",
             cwd: REPO_ROOT,
             url: `${BACKEND_URL}/api/health`,
             reuseExistingServer: !process.env.CI,
