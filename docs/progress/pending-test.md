@@ -4,3 +4,8 @@ description: 当前版本已实现但仍需人工验证的变更项
 ---
 
 # 待测试
+
+- 共享房间画布只读入口（C02-01）：登录后访问 `/canvas/rooms/:roomId` 可通过 `GET /api/v1/collab/rooms/:id/graph` 加载房间公共图并只读渲染；该路由与单人项目 `/canvas/:id` 使用独立状态边界，不会写入个人画布本地存储或个人项目接口。可用 `NEXT_PUBLIC_ENABLE_CANVAS_COLLAB=false` 关闭共享入口回退单人体验。
+- 共享房间实时接收（C02-03）：`/canvas/rooms/:roomId` 会用 `POST /api/v1/collab/rooms/:id/ws-ticket` 换取一次性 ticket，再连 `GET /api/v1/collab/rooms/:id/ws` 并发送首帧 `hello`（协议版本校验）。收到 `snapshot-*` 分帧快照、`changes` 增量、`presence` 在线成员、`cursors` 协作光标与 `error` 后更新画布；断网/切标签页后按当前 revision 自动重连并补发未确认操作，重连期间本地未确认草稿不清空。权限被撤销（4401/4403 或 `unauthorized`/`forbidden` 等错误码）后页面显示访问失效并停止接受广播。前后端分离开发时可用 `NEXT_PUBLIC_COLLAB_WS_BASE`（如 `ws://127.0.0.1:8080`）指向 Go 后端 WS 端点。
+- 共享房间成员与分享管理 UI（C02-05）：`/canvas/rooms/:roomId` 顶部新增「成员与分享」入口，任何成员可查看成员列表；owner 可改成员角色（可编辑/只读）、移除成员、生成邀请链接（选角色 + 有效期 1/3/7/30 天）、查看邀请状态并撤销、复制邀请链接。邀请链接为 `/canvas/rooms/:roomId#invite=<token>`（令牌放 URL fragment，读取后立即清除，不进服务端日志）；打开邀请链接未登录时先跳登录/注册，登录后自动调用 `POST /api/v1/collab/invites/accept` 加入房间。viewer 不显示可写操作入口，非 owner 不显示成员管理入口（后端仍按 `docs/collab-v1/security-boundaries.md` 矩阵二次鉴权）。
+- 协作历史审计与撤销/重做（C01-06，仅服务端）：每次成功操作批次写入 `collab_room_history`（含操作者、时间、批次 operationId、前后版本与逐目标快照）。`GET /api/v1/collab/rooms/:id/history` 返回审计列表；`POST .../history/:historyId/undo`、`.../redo` 按用户隔离撤销/重做自己的操作（节点与关联连线一起恢复/移除），切换时以行版本做条件 CAS；若相关节点/连线已被他人修改则返回 `version_conflict`（`reason=history_invalidated`）且不覆盖他人修改。连续拖动（仅改坐标的 update）会合并为一条历史。前端撤销 UI 属 C01-06 之外（#15）。

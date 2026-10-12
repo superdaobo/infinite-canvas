@@ -1,0 +1,18 @@
+{
+    "name": "infinite-canvas-e2e",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "description": "无限画布协作 v1 双浏览器端到端测试基线（Playwright）",
+    "scripts": {
+        "test": "playwright test",
+        "test:baseline": "playwright test tests/baseline.spec.ts",
+        "test:headed": "playwright test --headed",
+        "report": "playwright show-report",
+        "install:browsers": "playwright install chromium"
+    },
+    "devDependencies": {
+        "@playwright/test": "1.64.0",
+        "@types/node": "^24.0.0"
+    }
+}

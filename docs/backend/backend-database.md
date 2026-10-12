@@ -36,6 +36,15 @@ description: 当前后端主要数据表与字段说明
 - `canvas_projects`
 - `user_configs`
 - `storage_objects`
+- `collab_rooms`
+- `collab_room_members`
+- `collab_room_invites`
+- `collab_room_nodes`
+- `collab_room_edges`
+- `collab_room_operations`
+- `collab_room_history`
+- `collab_room_media`
+- `school_tasks`
 
 后续新增表时再同步补充本文档，未实际使用的规划表不提前写入。
 
@@ -365,6 +374,183 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 | `deleted_at` | string | 软删除时间，空字符串表示未删除；超过 7 天由启动时和每天定时任务物理清理 |
 
 索引：`idx_canvas_projects_user_deleted_updated (user_id, deleted_at, updated_at)`、`idx_canvas_projects_deleted_at (deleted_at)`
+
+
+### collab_rooms
+
+协作共享房间表（协作 v1）。每个房间一行，与个人画布 `canvas_projects` 完全独立；`revision` 用于后续操作批次的版本推进，本阶段仅做持久化基础。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 房间 ID，主键 |
+| `owner_id` | string | 房间创建者（owner）用户 ID |
+| `title` | string | 房间标题，最长 512 rune |
+| `revision` | number | 房间图版本号，初始为 0，提交成功后递增 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_collab_rooms_owner_updated (owner_id, updated_at)`
+
+### collab_room_members
+
+协作房间成员关系表（协作 v1）。一条记录表示某用户对某房间的访问权与角色，`room_id + user_id` 组成主键。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `user_id` 组成主键 |
+| `user_id` | string | 成员用户 ID |
+| `role` | string | 房间角色：`owner`、`editor`、`viewer` |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_collab_room_members_user (user_id)`
+
+删除房间时在同一事务内级联删除该房间的成员关系；该操作只作用于协作房间表，不改动个人画布。
+
+
+### collab_room_invites
+
+协作房间邀请表（协作 v1）。一条记录表示一个可撤销的分享链接；数据库只保存令牌的 SHA-256 哈希，明文令牌仅在创建响应里返回一次。邀请只能授予 `editor` 或 `viewer`，不能授予 `owner`；撤销或过期后令牌立即失效。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 邀请 ID，主键（可公开用于管理，不泄漏令牌） |
+| `room_id` | string | 房间 ID |
+| `role` | string | 邀请授予的角色：`editor`、`viewer` |
+| `token_hash` | string | 邀请令牌的 SHA-256 哈希，唯一索引，绝不返回给客户端 |
+| `created_by` | string | 创建邀请的 owner 用户 ID |
+| `expires_at` | datetime | 邀请过期时间 |
+| `revoked_at` | datetime | 撤销时间，空表示未撤销 |
+| `created_at` | datetime | 创建时间 |
+| `updated_at` | datetime | 更新时间 |
+
+索引：`idx_collab_room_invites_room (room_id)`、`token_hash` 唯一索引
+
+删除房间时在同一事务内级联删除该房间的邀请记录。
+
+### collab_room_nodes
+
+协作房间公共图节点表（协作 v1）。`room_id + id` 组成主键；`metadata` 只存进入公共图的 JSON 字段，`deleted` 为软删除墓碑（用于区分“已删除”与“从未存在”）。`version` 是节点版本，供 `expectedNodeVersion` 冲突检测使用。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `id` 组成主键 |
+| `id` | string | 节点 ID |
+| `kind` | string | 节点种类：`image`/`panorama`/`video`/`audio`/`text`/`group`/`config`/`director` |
+| `title` | string | 标题，最长 512 rune |
+| `position_x` / `position_y` | number | 世界坐标 |
+| `width` / `height` | number | 正有限宽高 |
+| `version` | number | 节点版本，创建后从 1 起，每次成功修改 +1 |
+| `metadata` | text | 公共 metadata 的 JSON |
+| `deleted` | bool | 软删除标记 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_nodes_room_deleted (room_id, deleted)`
+
+### collab_room_edges
+
+协作房间公共图连线表（协作 v1）。`room_id + id` 组成主键，表示 `from_node_id -> to_node_id` 的有向边；端点必须属于同一房间且未删除。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `id` 组成主键 |
+| `id` | string | 连线 ID |
+| `from_node_id` / `to_node_id` | string | 有向端点节点 ID |
+| `version` | number | 连线版本，新建为 1，更新 +1 |
+| `deleted` | bool | 软删除标记 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_edges_room_deleted (room_id, deleted)`
+
+### collab_room_operations
+
+协作房间操作幂等回执表（协作 v1）。`room_id + user_id + operation_id` 组成主键；`request_digest` 是请求体摘要，`response_json` 是已存结果。相同幂等键 + 相同摘要直接返回既有结果，摘要不同返回 `operation_id_reused`。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `user_id`、`operation_id` 组成主键 |
+| `user_id` | string | 提交用户 ID |
+| `operation_id` | string | 幂等键 |
+| `request_digest` | string | 请求体 SHA-256 摘要 |
+| `revision` | number | 该次提交后的房间 revision |
+| `response_json` | text | 已存结果 JSON |
+| `created_at` | datetime | 时间戳 |
+
+节点/连线/回执在同一事务内写入，房间 `revision` 恰好 +1；任一操作失败整批回滚。
+
+
+### collab_room_history
+
+协作房间操作历史表（协作 v1，C01-06 #11）。一次成功批次（`operationId`）对应一行，逐目标记录操作前后的行快照与版本，既用于审计（谁、何时、对哪个房间做了什么、前后版本），也用于撤销/重做。与节点/连线/幂等回执在**同一事务**内写入，因此不存在“已改图但无历史”的窗口。
+
+撤销/重做按用户隔离：只有 `actor_id` 本人且仍是可写成员才能操作。撤销/重做把每个目标在 `before`/`after` 状态之间切换，切换时以行 `version` 做条件 CAS；若目标已被他人修改（版本前进），整条历史失效并返回 `version_conflict`（`reason=history_invalidated`），绝不覆盖他人修改。连续拖动（单条仅改坐标的 `update`）会合并进上一条同类历史并累计 `merged`。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 历史记录 ID，主键 |
+| `room_id` | string | 房间 ID |
+| `operation_id` | string | 产生该历史的批次 operationId（幂等键） |
+| `actor_id` | string | 操作者用户 ID（撤销/重做的隔离依据） |
+| `revision` | number | 该批次提交后的房间 revision（审计与合并判定用；撤销/重做不改写） |
+| `summary` | string | 人类可读变更摘要 |
+| `ops_json` | text | 逐目标明细 JSON：op/target/id/before/after/active/version/merged |
+| `status` | string | `applied`（变更在图中）/ `undone`（已被本人撤销） |
+| `undone_by` | string | 撤销该历史的批次 operationId（`undo_<historyId>`） |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_history_room_revision (room_id, revision)`、`idx_collab_room_history_actor (actor_id)`
+
+与 `collab_room_nodes`/`collab_room_edges`/`collab_room_operations` 一致，当前删除房间的级联只清理成员、邀请与媒体，不清理历史（历史保留用于审计）。
+
+
+### collab_room_media
+
+协作房间共享媒体索引表（协作 v1，C04-01）。`room_id + id` 组成主键，`id` 为内容 SHA-256 摘要，因此同一房间重复上传相同内容会命中同一行（按摘要去重）。字节存放在服务端私有内容寻址目录（`MEDIA_DIR`，默认 `data/collab-media`），`storage_path` 相对该目录且绝不返回给客户端；房间媒体**不登记为公开的 `storage_objects`**，只能通过 `/api/v1/collab/rooms/:id/media/...` 的成员鉴权接口读取，不会被 `GET /api/files/:id` 匿名命中。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `room_id` | string | 房间 ID，与 `id` 组成主键 |
+| `id` | string | 内容 SHA-256 十六进制摘要 |
+| `kind` | string | 媒体类别：`image`、`video`、`audio` |
+| `filename` | string | 原始文件名，最长 200 rune |
+| `mime_type` | string | 规范化后的 MIME 类型 |
+| `bytes` | number | 字节数 |
+| `storage_path` | string | 相对 `MEDIA_DIR` 的私有路径，绝不外泄 |
+| `created_by` | string | 上传者用户 ID |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_media_room_created (room_id, updated_at)`
+
+删除房间时在同一事务内级联删除该房间的媒体索引；blob 采用内容寻址，删除记录后若已无其他房间引用同一内容才回收文件。
+
+
+### school_tasks
+
+学校共享生成任务队列表（协作 v1，C03-02）。房间成员提交任务后按 FIFO 串行执行，全局只有一个执行中任务（单执行槽）。表名不带 `collab_` 前缀，因为它是学校渠道专用队列，与房间图/媒体表分离。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键，由 `(room_id, submitted_by, client_task_id)` 确定性派生 |
+| `room_id` | string | 所属协作房间 |
+| `submitted_by` | string | 真实提交人用户 ID（非执行设备） |
+| `client_task_id` | string | 提交端生成的幂等键 |
+| `executor_id` | string | 受限执行设备身份；未领取时为空 |
+| `upstream_task_id` | string | 上游学校任务号，首次绑定后不可替换 |
+| `channel` | string | 学校渠道：`qwen`（文生图）、`h3`（1–9 参考图视频） |
+| `status` | string | 状态机：`queued`、`running`、`succeeded`、`failed`、`cancelled` |
+| `params_json` | text | 生成参数 JSON（prompt、有序参考图、秒数等） |
+| `error` | text | 失败原因或恢复说明（可审计） |
+| `running_slot` | number | 仅 running 任务写入 `1`，其余为 NULL |
+| `last_seen_at` | datetime | 执行设备最近心跳时间，用于识别中断 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引与约束：
+
+- `idx_school_tasks_idem (room_id, submitted_by, client_task_id)` 唯一索引：保证重复提交幂等，不触发第二次学校执行。
+- `idx_school_tasks_one_running (running_slot)` 唯一索引：只有 running 任务写非 NULL 槽位，其余为 NULL。利用 SQLite/MySQL/PostgreSQL「唯一索引不把多个 NULL 视为重复」的语义，在数据库层保证**全局最多一个 running 任务**（单执行槽）。
+- `idx_school_tasks_queue (status, created_at)`：队列按 `created_at, id` 升序 FIFO 领取。
+
+领取走单事务：先确认没有 running，再取最早的 queued 任务并置为 running；并发事务由 `running_slot` 唯一索引兜底，不会双领。服务重启或设备中断后 running 任务**保持 running**、保留 `upstream_task_id` 与设备绑定，绝不自动改回 queued，也不重复生成；恢复由设备显式调用 `/api/bridge/school/recover` 完成（写 `error` 作为审计说明）。
 
 
 ### settings

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -130,6 +131,11 @@ func DeleteDirectFileRecord(w http.ResponseWriter, r *http.Request, id string) {
 
 // FileContent 获取文件内容。
 func FileContent(w http.ResponseWriter, r *http.Request, id string) {
+	// R1 收敛：房间共享媒体不得经公开对象 ID 路径读取，必须走成员鉴权接口。
+	if err := service.AuthorizeFileRead(id); err != nil {
+		writeFileReadDenied(w, err)
+		return
+	}
 	download, err := service.DownloadStorageObject(id, r.Header.Get("Range"))
 	if err != nil {
 		FailError(w, err)
@@ -155,12 +161,26 @@ func FileContent(w http.ResponseWriter, r *http.Request, id string) {
 
 // FileInfo 获取文件元数据。
 func FileInfo(w http.ResponseWriter, r *http.Request, id string) {
+	// R1 收敛：房间共享媒体不得经公开对象 ID 路径读取元数据。
+	if err := service.AuthorizeFileRead(id); err != nil {
+		writeFileReadDenied(w, err)
+		return
+	}
 	object, err := service.StorageObjectInfo(id)
 	if err != nil {
 		FailError(w, err)
 		return
 	}
 	OK(w, object)
+}
+
+// writeFileReadDenied 把公开文件读取路径的拒绝结果映射为 404，不泄漏资源是否存在。
+func writeFileReadDenied(w http.ResponseWriter, err error) {
+	if errors.Is(err, service.ErrMediaNotFound) {
+		FailWithStatus(w, http.StatusNotFound, err.Error())
+		return
+	}
+	FailError(w, err)
 }
 
 // AdminMeasureStorageProvider 管理员统计存储容量。

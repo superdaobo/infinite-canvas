@@ -23,10 +23,10 @@ func New() *gin.Engine {
 	api.GET("/auth/me", middleware.OptionalAuth, gin.WrapF(handler.CurrentUser))
 	api.GET("/settings", gin.WrapF(handler.Settings))
 	api.GET("/storage/config", gin.WrapF(handler.StorageConfig))
-	api.GET("/files/:id", func(c *gin.Context) {
+	api.GET("/files/:id", middleware.OptionalAuth, func(c *gin.Context) {
 		handler.FileInfo(c.Writer, c.Request, c.Param("id"))
 	})
-	api.GET("/files/:id/content", func(c *gin.Context) {
+	api.GET("/files/:id/content", middleware.OptionalAuth, func(c *gin.Context) {
 		handler.FileContent(c.Writer, c.Request, c.Param("id"))
 	})
 	api.POST("/ai/direct-request", gin.WrapF(handler.PrepareDirectAIRequest))
@@ -120,6 +120,71 @@ func New() *gin.Engine {
 	})
 	v1.GET("/user-data/assets", gin.WrapF(handler.UserAssetData))
 	v1.POST("/user-data/assets", gin.WrapF(handler.SaveUserAssetData))
+	v1.GET("/collab/rooms", gin.WrapF(handler.CollabRooms))
+	v1.POST("/collab/rooms", gin.WrapF(handler.CollabCreateRoom))
+	v1.GET("/collab/rooms/:id", func(c *gin.Context) { handler.CollabRoomDetail(c.Writer, c.Request, c.Param("id")) })
+	v1.DELETE("/collab/rooms/:id", func(c *gin.Context) { handler.CollabDeleteRoom(c.Writer, c.Request, c.Param("id")) })
+	v1.GET("/collab/rooms/:id/members", func(c *gin.Context) { handler.CollabRoomMembers(c.Writer, c.Request, c.Param("id")) })
+	v1.PATCH("/collab/rooms/:id/members/:userId", func(c *gin.Context) {
+		handler.CollabUpdateRoomMemberRole(c.Writer, c.Request, c.Param("id"), c.Param("userId"))
+	})
+	v1.DELETE("/collab/rooms/:id/members/:userId", func(c *gin.Context) {
+		handler.CollabRemoveRoomMember(c.Writer, c.Request, c.Param("id"), c.Param("userId"))
+	})
+	v1.GET("/collab/rooms/:id/invites", func(c *gin.Context) { handler.CollabRoomInvites(c.Writer, c.Request, c.Param("id")) })
+	v1.POST("/collab/rooms/:id/invites", func(c *gin.Context) { handler.CollabCreateRoomInvite(c.Writer, c.Request, c.Param("id")) })
+	v1.POST("/collab/rooms/:id/invites/:inviteId/revoke", func(c *gin.Context) {
+		handler.CollabRevokeRoomInvite(c.Writer, c.Request, c.Param("id"), c.Param("inviteId"))
+	})
+	v1.POST("/collab/invites/accept", gin.WrapF(handler.CollabAcceptInvite))
+	v1.POST("/collab/rooms/:id/operations", func(c *gin.Context) { handler.CollabApplyOperations(c.Writer, c.Request, c.Param("id")) })
+	v1.GET("/collab/rooms/:id/graph", func(c *gin.Context) { handler.CollabRoomGraph(c.Writer, c.Request, c.Param("id")) })
+	// 协作历史审计与撤销/重做（C01-06 #11）：均按房间成员鉴权，撤销按用户隔离。
+	v1.GET("/collab/rooms/:id/history", func(c *gin.Context) {
+		handler.CollabRoomHistory(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.POST("/collab/rooms/:id/history/:historyId/undo", func(c *gin.Context) {
+		handler.CollabUndoRoomHistory(c.Writer, c.Request, c.Param("id"), c.Param("historyId"))
+	})
+	v1.POST("/collab/rooms/:id/history/:historyId/redo", func(c *gin.Context) {
+		handler.CollabRedoRoomHistory(c.Writer, c.Request, c.Param("id"), c.Param("historyId"))
+	})
+	v1.POST("/collab/rooms/:id/ws-ticket", func(c *gin.Context) {
+		handler.CollabCreateWSTicket(c.Writer, c.Request, c.Param("id"))
+	})
+	// 房间级共享媒体：上传/播放/下载/删除均按房间成员鉴权（见 docs/collab-v1/security-boundaries.md）。
+	v1.POST("/collab/rooms/:id/media", func(c *gin.Context) {
+		handler.CollabUploadRoomMedia(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/collab/rooms/:id/media", func(c *gin.Context) {
+		handler.CollabRoomMediaList(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/collab/rooms/:id/media/:mediaId", func(c *gin.Context) {
+		handler.CollabRoomMediaMeta(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	v1.GET("/collab/rooms/:id/media/:mediaId/content", func(c *gin.Context) {
+		handler.CollabRoomMediaContent(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	v1.GET("/collab/rooms/:id/media/:mediaId/download", func(c *gin.Context) {
+		handler.CollabRoomMediaDownload(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	v1.DELETE("/collab/rooms/:id/media/:mediaId", func(c *gin.Context) {
+		handler.CollabDeleteRoomMedia(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
+	})
+	// 学校共享生成任务队列（C03-02）：提交/列表/取消，均按房间成员鉴权。
+	v1.POST("/collab/rooms/:id/school-tasks", func(c *gin.Context) {
+		handler.CollabSubmitSchoolTask(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/collab/rooms/:id/school-tasks", func(c *gin.Context) {
+		handler.CollabRoomSchoolTasks(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.POST("/collab/rooms/:id/school-tasks/:taskId/cancel", func(c *gin.Context) {
+		handler.CollabCancelSchoolTask(c.Writer, c.Request, c.Param("id"), c.Param("taskId"))
+	})
+	// WS 升级端点不挂 UserAuth：身份由首帧 hello 的 ticket 绑定，JWT 不入 URL。
+	api.GET("/v1/collab/rooms/:id/ws", func(c *gin.Context) {
+		handler.CollabWS(c.Writer, c.Request, c.Param("id"))
+	})
 	api.GET("/proxy-image", gin.WrapF(handler.ProxyImage))
 	api.GET("/prompts", middleware.OptionalAuth, gin.WrapF(handler.Prompts))
 	api.GET("/agent-skills", gin.WrapF(handler.AgentSkills))
@@ -159,6 +224,13 @@ func New() *gin.Engine {
 	bridge.GET("/poll", gin.WrapF(handler.BridgeComfyPoll))
 	bridge.POST("/lease", gin.WrapF(handler.BridgeComfyLease))
 	bridge.POST("/result", gin.WrapF(handler.BridgeComfyResult))
+	// 学校受限执行设备接口（C03-02）：独立分组、Bearer 设备令牌，与用户 JWT 分离。
+	schoolBridge := api.Group("/bridge/school")
+	schoolBridge.POST("/claim", gin.WrapF(handler.BridgeSchoolClaim))
+	schoolBridge.POST("/update", gin.WrapF(handler.BridgeSchoolUpdate))
+	schoolBridge.POST("/finish", gin.WrapF(handler.BridgeSchoolFinish))
+	schoolBridge.POST("/result", gin.WrapF(handler.BridgeSchoolResult))
+	schoolBridge.POST("/recover", gin.WrapF(handler.BridgeSchoolRecover))
 	admin.POST("/storage/measure", gin.WrapF(handler.AdminMeasureStorageProvider))
 	admin.GET("/prompt-categories", gin.WrapF(handler.AdminPromptCategories))
 	admin.POST("/prompt-categories/sync", gin.WrapF(handler.AdminSyncPromptCategories))

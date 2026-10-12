@@ -20,6 +20,7 @@ const CanvasPanoramaViewer = dynamic(() => import("./canvas-panorama-viewer"), {
 type CanvasNodeProps = {
     data: CanvasNodeData;
     scale: number;
+    readOnly?: boolean;
     isSelected: boolean;
     isRelated: boolean;
     isFocusRelated: boolean;
@@ -58,6 +59,7 @@ type CanvasNodeProps = {
 type NodeContentRendererProps = {
     node: CanvasNodeData;
     theme: (typeof canvasThemes)[keyof typeof canvasThemes];
+    readOnly?: boolean;
     isSelected: boolean;
     isEditingContent: boolean;
     textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -81,6 +83,7 @@ type NodeContentRendererProps = {
 export const CanvasNode = React.memo(function CanvasNode({
     data,
     scale,
+    readOnly = false,
     isSelected,
     isRelated,
     isFocusRelated,
@@ -331,8 +334,8 @@ export const CanvasNode = React.memo(function CanvasNode({
                         type="button"
                         className="block max-w-full truncate border-b border-dashed border-transparent px-0 py-0.5 text-left text-xs font-medium opacity-75 transition hover:border-current hover:opacity-100"
                         style={{ color: theme.node.text }}
-                        title="双击修改节点名称"
-                        onDoubleClick={(event) => {
+                        title={readOnly ? undefined : "双击修改节点名称"}
+                        onDoubleClick={readOnly ? undefined : (event) => {
                             event.stopPropagation();
                             setIsEditingTitle(true);
                         }}
@@ -356,6 +359,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                 }}
                 onMouseDown={(event) => onMouseDown(event, data.id)}
                 onDoubleClick={(event) => {
+                    if (readOnly) return;
                     if (referenceSelectionState) {
                         event.preventDefault();
                         event.stopPropagation();
@@ -395,6 +399,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                         <NodeContent
                             node={data}
                             theme={theme}
+                            readOnly={readOnly}
                             isSelected={isSelected}
                             now={now}
                             isEditingContent={isEditingContent}
@@ -427,13 +432,13 @@ export const CanvasNode = React.memo(function CanvasNode({
                     </div>
                 ) : null}
 
-                {!referenceSelectionState ? <ResizeHandle corner="top-left" onMouseDown={handleResizeMouseDown} /> : null}
-                {!referenceSelectionState ? <ResizeHandle corner="top-right" onMouseDown={handleResizeMouseDown} /> : null}
-                {!referenceSelectionState ? <ResizeHandle corner="bottom-left" onMouseDown={handleResizeMouseDown} /> : null}
-                {!referenceSelectionState ? <ResizeHandle corner="bottom-right" onMouseDown={handleResizeMouseDown} /> : null}
+                {!referenceSelectionState && !readOnly ? <ResizeHandle corner="top-left" onMouseDown={handleResizeMouseDown} /> : null}
+                {!referenceSelectionState && !readOnly ? <ResizeHandle corner="top-right" onMouseDown={handleResizeMouseDown} /> : null}
+                {!referenceSelectionState && !readOnly ? <ResizeHandle corner="bottom-left" onMouseDown={handleResizeMouseDown} /> : null}
+                {!referenceSelectionState && !readOnly ? <ResizeHandle corner="bottom-right" onMouseDown={handleResizeMouseDown} /> : null}
             </div>
 
-            {!referenceSelectionState && !isGroup ? (
+            {!referenceSelectionState && !readOnly && !isGroup ? (
                 <>
                     <ConnectionHandleDot side="left" visible={hovered || isSelected || isConnecting} onMouseDown={(event) => onConnectStart(event, data.id, "target")} />
                     <ConnectionHandleDot side="right" visible={data.type !== CanvasNodeType.Config && (hovered || isSelected || isConnecting)} onMouseDown={(event) => onConnectStart(event, data.id, "source")} />
@@ -556,7 +561,7 @@ function UnknownNodeContent({ theme }: Pick<NodeContentRendererProps, "theme">) 
     );
 }
 
-function TextContent({ node, theme, isEditingContent, textareaRef, mentionReferences, onContentChange, onStopEditing }: NodeContentRendererProps) {
+function TextContent({ node, theme, readOnly, isEditingContent, textareaRef, mentionReferences, onContentChange, onStopEditing }: NodeContentRendererProps) {
     const fontSize = node.metadata?.fontSize || 14;
     const textStyle = { fontSize: `${fontSize}px`, lineHeight: `${Math.round(fontSize * 1.65)}px`, color: theme.node.text, boxSizing: "border-box" } as React.CSSProperties;
 
@@ -585,7 +590,7 @@ function TextContent({ node, theme, isEditingContent, textareaRef, mentionRefere
                     style={textStyle}
                     onWheelCapture={(event) => event.stopPropagation()}
                 >
-                    {node.metadata?.content || <span style={{ color: theme.node.placeholder }}>双击编辑文字</span>}
+                    {node.metadata?.content || <span style={{ color: theme.node.placeholder }}>{readOnly ? "空文本节点" : "双击编辑文字"}</span>}
                 </div>
             )}
         </div>
@@ -613,6 +618,7 @@ function ImageNodeContent(props: NodeContentRendererProps) {
     return (
         <ImageContent
             node={props.node}
+            readOnly={props.readOnly}
             isBatchRoot={props.isBatchRoot}
             batchCount={props.batchCount}
             batchExpanded={props.batchExpanded}
@@ -632,6 +638,7 @@ function PanoramaNodeContent(props: NodeContentRendererProps) {
     return (
         <ImageContent
             node={props.node}
+            readOnly={props.readOnly}
             isBatchRoot={props.isBatchRoot}
             batchCount={props.batchCount}
             batchExpanded={props.batchExpanded}
@@ -748,6 +755,7 @@ function AudioNodeContent({ node, theme }: NodeContentRendererProps) {
 
 function ImageContent({
     node,
+    readOnly,
     isBatchRoot,
     batchCount,
     batchExpanded,
@@ -758,6 +766,7 @@ function ImageContent({
     media,
 }: {
     node: CanvasNodeData;
+    readOnly?: boolean;
     isBatchRoot: boolean;
     batchCount: number;
     batchExpanded: boolean;
@@ -783,7 +792,7 @@ function ImageContent({
                     />
                 )}
             </div>
-            {isBatchRoot ? (
+            {isBatchRoot && !readOnly ? (
                 <button
                     type="button"
                     className="absolute right-2.5 top-2.5 z-30 flex h-8 items-center justify-center gap-1 rounded-full border px-2.5 text-xs font-semibold shadow-[0_6px_18px_rgba(15,23,42,.10)] backdrop-blur-md transition hover:scale-[1.02]"
@@ -800,7 +809,7 @@ function ImageContent({
                     <ChevronRight className={`size-3.5 opacity-55 transition-transform ${batchExpanded ? "rotate-90" : ""}`} />
                 </button>
             ) : null}
-            {isBatchChild ? (
+            {isBatchChild && !readOnly ? (
                 <button
                     type="button"
                     className="absolute right-3 top-3 z-30 flex h-9 items-center gap-1.5 rounded-xl border px-2.5 text-xs font-medium opacity-0 shadow-[0_8px_20px_rgba(68,64,60,.13)] backdrop-blur-md transition group-hover/batch:opacity-100 hover:scale-[1.02]"
