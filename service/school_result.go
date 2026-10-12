@@ -105,7 +105,7 @@ func UploadSchoolTaskResult(ctx context.Context, executorID, taskID string, inpu
 	if err != nil {
 		return SchoolResultBackfill{}, err
 	}
-	node, idempotent, err := backfillSchoolResultNode(ctx, task, view)
+	node, idempotent, err := backfillSchoolResultNode(task, view)
 	if err != nil {
 		return SchoolResultBackfill{}, err
 	}
@@ -172,9 +172,9 @@ func fetchAndValidateSchoolResult(ctx context.Context, task model.SchoolTask, in
 	return schoolResultMedia{bytes: raw, contentType: mimeType, filename: filename}, nil
 }
 
-// backfillSchoolResultNode 以确定性幂等键走 #8 原子提交路径创建结果节点并广播。
+// backfillSchoolResultNode 以确定性幂等键走受约束服务端回填通道创建结果节点并广播。
 // 只创建新节点，绝不更新/删除既有节点，因此不会用本地旧快照覆盖共享画布。
-func backfillSchoolResultNode(ctx context.Context, task model.SchoolTask, media model.RoomMediaView) (model.RoomNode, bool, error) {
+func backfillSchoolResultNode(task model.SchoolTask, media model.RoomMediaView) (model.RoomNode, bool, error) {
 	nodeID := schoolResultNodeID(task)
 	kind := contract.NodeKindImage
 	if task.Channel.IsVideo() {
@@ -199,9 +199,11 @@ func backfillSchoolResultNode(ctx context.Context, task model.SchoolTask, media 
 			},
 		}},
 	}
-	// 以任务提交人身份提交：复用 #8 的成员鉴权、幂等回执、revision 推进与提交后广播。
-	submitterCtx := WithUser(ctx, model.AuthUser{ID: task.SubmittedBy})
-	result, err := ApplyRoomOperations(submitterCtx, task.RoomID, envelope)
+	// 走受约束的服务端回填通道：授权已在 requireRunningSchoolTask 完成（任务 running
+	// 且绑定当前执行设备），因此不再要求提交人当前仍是可写成员。提交人可能已被移除或
+	// 降为 viewer，结果仍必须能回填并释放单执行槽（修复 PR #47 审查 P1 队列堵塞）。
+	// SubmittedBy 仍写入节点 metadata 与幂等回执，审计信息保留。
+	result, err := backfillSchoolResultViaServer(task.RoomID, task.SubmittedBy, envelope)
 	if err != nil {
 		// 节点已存在（先前回填已创建）：视为幂等命中，读取既有节点返回，绝不覆盖。
 		if contractCode(err) == contract.CodeNodeExists {
