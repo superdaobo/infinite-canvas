@@ -153,6 +153,7 @@ const (
 	CodeNodeDeleted          = "node_deleted"
 	CodeEdgeChanged          = "edge_changed"
 	CodeOperationIDReused    = "operation_id_reused"
+	CodeRoomNotEmpty         = "room_not_empty"
 	CodeDuplicateTarget      = "duplicate_target"
 	CodeCycleDetected        = "cycle_detected"
 	CodePayloadTooLarge      = "payload_too_large"
@@ -170,7 +171,7 @@ func StatusFor(code string) int {
 		return 403
 	case CodeNotFound:
 		return 404
-	case CodeVersionConflict, CodeNodeExists, CodeNodeDeleted, CodeEdgeChanged, CodeOperationIDReused:
+	case CodeVersionConflict, CodeNodeExists, CodeNodeDeleted, CodeEdgeChanged, CodeOperationIDReused, CodeRoomNotEmpty:
 		return 409
 	case CodePayloadTooLarge:
 		return 413

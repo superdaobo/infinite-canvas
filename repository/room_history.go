@@ -117,6 +117,8 @@ func mergeRoomHistory(tx *gorm.DB, roomID, actorID string, revision int64, ops [
 }
 
 // historySummary 生成人类可读的变更摘要（审计展示用）。
+// 结果按 rune 截断到 historySummaryMaxRunes，避免大批次（如整份旧画布导入）的摘要
+// 超过 collab_room_history.summary 的列长度。
 func historySummary(ops []model.RoomHistoryOp) string {
 	labels := map[string]string{
 		"create": "创建", "update": "更新", "delete": "删除",
@@ -138,8 +140,16 @@ func historySummary(ops []model.RoomHistoryOp) string {
 		}
 		parts = append(parts, text)
 	}
-	return strings.Join(parts, "；")
+	summary := strings.Join(parts, "；")
+	runes := []rune(summary)
+	if len(runes) > historySummaryMaxRunes {
+		return string(runes[:historySummaryMaxRunes]) + "…"
+	}
+	return summary
 }
+
+// historySummaryMaxRunes 是摘要的最大 rune 数，需与 collab_room_history.summary 列长度一致。
+const historySummaryMaxRunes = 1024
 
 func decodeRoomHistoryOps(row model.RoomHistory) ([]model.RoomHistoryOp, error) {
 	if strings.TrimSpace(row.OpsJSON) == "" {

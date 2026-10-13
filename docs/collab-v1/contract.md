@@ -300,6 +300,7 @@ private（owner 独占，单独存储）：`imageTaskId`、`imageTaskResultId`�
 | `node_deleted` | 409 | 更新/删除已删除节点 |
 | `edge_changed` | 409 | 连线版本已变化 |
 | `operation_id_reused` | 409 | operationId 复用于不同请求体 |
+| `room_not_empty` | 409 | 旧画布整份导入（#25）目标房间已有成员操作或成员，拒绝用旧快照覆盖 |
 | `duplicate_target` | 400 | 同批次重复修改同一目标 / 连线 ID 重复 |
 | `cycle_detected` | 400 | 连线成环 |
 | `payload_too_large` | 413 | 单批操作数或单帧负载超限 |
@@ -403,3 +404,28 @@ private（owner 独占，单独存储）：`imageTaskId`、`imageTaskResultId`�
 - 参考仓库为 Vite/React，协议语义可借鉴但前端实现不可照搬；本契约只固定数据与协议层。
 - 学校真实渠道、设备、凭据操作需单独授权，本任务不涉及。
 - `types.ts` 的 `metadata` 仍在演进；本契约以当前 SHA 快照为准，后续新增字段默认 public，需在实现 Issue 中同步白名单。
+
+---
+
+## 9. 旧画布导入（C04-02 / #25）
+
+旧单人画布是整份 JSON（`nodes` + `connections`）保存在浏览器本地/个人项目。导入把其公共部分
+复制为**新共享房间**的公共图，字段映射遵循第 2 节可见性矩阵，不丢源数据、不覆盖成员后续修改。
+
+- **端点**：`POST /api/v1/collab/rooms/{roomId}/import`，请求体 `{ "mode": "preview"|"initial", "snapshot": { id, title, nodes, connections } }`。
+- **模式**：`mode` 为空或 `preview` 为**只读预扫描**（不写库、不联网），返回节点/边/媒体数量、
+  8 类节点字段摘要与不可迁移清单；只有显式 `mode=initial` 才写入。
+- **只允许空房间**：目标房间 `revision>0`（已有成员操作）或除 owner 外还有成员时，整份导入返回
+  `room_not_empty`（409），绝不把旧快照恢复成成员的现有编辑。仅 `owner` 可执行导入。
+- **字段映射**：`private` metadata（如 `clientTaskId`/`errorDetails`/`composerContent` 等）与
+  `local` 字段（`status`/`progress`/`startedAt`）不导入为公共字段；命中凭据类键的节点整体跳过并报告。
+- **媒体迁移**：只拉取来源白名单（`COLLAB_MEDIA_IMPORT_ORIGINS`，逗号分隔 `scheme://host[:port]`，
+  例如本机 Bridge）内的 http(s) 媒体并登记为房间共享媒体；`127.0.0.1` 等不可达/非白名单来源、
+  本地 `blob:`/`data:` 引用与 `server:` 引用一律标记为「素材未同步」（`metadata.mediaError`）并清除
+  引用，**绝不写入悬空引用**。类型仍走第 2.2/媒体层白名单，SVG/主动内容一律拒绝。
+- **幂等与原子**：幂等键为 `(roomId, userId, operationId)`，`operationId` 由
+  `(roomId, sourceId, 快照摘要)` 确定性派生；重复导入同摘要命中同一回执，不产生重复节点、
+  不重复推进 revision。写入复用单事务原子路径（全成功或全回滚）。
+- **不可迁移清单**：报告含跳过节点/连线及原因、待补传媒体（只暴露 `origin`，不含路径/凭据）
+  与 `warnings`；旧画布若含环状连线，候选图不合法，`initial` 模式整体失败并返回 `cycle_detected`。
+

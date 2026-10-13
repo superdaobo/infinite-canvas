@@ -187,6 +187,10 @@ func New() *gin.Engine {
 	v1.DELETE("/collab/rooms/:id/media/uploads/:sessionId", func(c *gin.Context) {
 		handler.CollabAbortRoomMediaUpload(c.Writer, c.Request, c.Param("id"), c.Param("sessionId"))
 	})
+	// 旧画布安全导入（C04-02 #25）：只允许导入空房间，媒体迁移、字段映射与幂等见 service/room_import.go。
+	v1.POST("/collab/rooms/:id/import", func(c *gin.Context) {
+		handler.CollabImportRoom(c.Writer, c.Request, c.Param("id"))
+	})
 	// 学校共享生成任务队列（C03-02）：提交/列表/取消，均按房间成员鉴权。
 	v1.POST("/collab/rooms/:id/school-tasks", func(c *gin.Context) {
 		handler.CollabSubmitSchoolTask(c.Writer, c.Request, c.Param("id"))
