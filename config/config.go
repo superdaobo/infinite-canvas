@@ -32,6 +32,11 @@ type Config struct {
 	// SchoolDeviceRegistrationSecret 是学校设备注册密钥（C03-03 / #19）。
 	// 为空表示设备注册关闭；仅由部署环境注入，明文绝不写入仓库。
 	SchoolDeviceRegistrationSecret string `env:"SCHOOL_DEVICE_REGISTRATION_SECRET"`
+	// CollabMediaImportOrigins 是旧画布导入（C04-02 / #25）时允许服务端拉取的媒体来源
+	// 白名单，逗号分隔的 scheme://host[:port]（例如本机 Bridge 的 http://127.0.0.1:8189）。
+	// 为空表示不允许服务端主动拉取任何外部媒体：旧项目中的 127.0.0.1 等地址一律标记为
+	// 「素材未同步」而不写入悬空引用。非白名单来源即便可达也不会被拉取。
+	CollabMediaImportOrigins string `env:"COLLAB_MEDIA_IMPORT_ORIGINS"`
 }
 
 var Cfg Config
