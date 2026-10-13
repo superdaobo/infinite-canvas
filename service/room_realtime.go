@@ -52,10 +52,20 @@ func RealtimeResolver() realtime.RoomResolver { return realtimeResolver{} }
 type realtimeResolver struct{}
 
 // ResolveMember 在建连时按当前成员表二次解析角色，成员被移除后即无法建连。
+// 同时校验账号未被封禁：封禁账号即使持有封禁前签发的 ticket 也不能建立实时连接，
+// 避免封禁后仍通过已签发的短时 ticket 进入房间。
 func (realtimeResolver) ResolveMember(roomID, userID string) (string, bool, error) {
-	member, ok, err := repository.FindRoomMember(strings.TrimSpace(roomID), strings.TrimSpace(userID))
+	userID = strings.TrimSpace(userID)
+	member, ok, err := repository.FindRoomMember(strings.TrimSpace(roomID), userID)
 	if err != nil || !ok {
 		return "", false, err
+	}
+	user, ok, err := repository.GetUserByID(userID)
+	if err != nil {
+		return "", false, err
+	}
+	if !ok || user.Status == model.UserStatusBan {
+		return "", false, nil
 	}
 	return string(member.Role), true, nil
 }

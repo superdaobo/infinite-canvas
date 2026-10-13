@@ -14,11 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tigerowo/infinite-canvas/config"
-	"github.com/tigerowo/infinite-canvas/model"
-	"github.com/tigerowo/infinite-canvas/repository"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/tigerowo/infinite-canvas/config"
+	"github.com/tigerowo/infinite-canvas/internal/collab/realtime"
+	"github.com/tigerowo/infinite-canvas/model"
+	"github.com/tigerowo/infinite-canvas/repository"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -304,6 +305,10 @@ func SaveUser(user model.User, password string) (model.User, error) {
 	user.UpdatedAt = now()
 	user, err := repository.SaveUser(user)
 	user.Password = ""
+	if err == nil && user.Status == model.UserStatusBan {
+		// 账号封禁即时失效：关闭其全部房间 WS 连接（安全边界 N3 / §2.3）。
+		realtime.Default.DisconnectUserEverywhere(user.ID, "账号已被封禁")
+	}
 	return user, err
 }
 
@@ -416,7 +421,12 @@ func DeleteCreditLog(id string) error {
 }
 
 func DeleteUser(id string) error {
-	return repository.DeleteUser(id)
+	if err := repository.DeleteUser(id); err != nil {
+		return err
+	}
+	// 删除账号同样即时失效：关闭其全部房间 WS 连接（安全边界 §2.3）。
+	realtime.Default.DisconnectUserEverywhere(strings.TrimSpace(id), "账号已删除")
+	return nil
 }
 
 func GuestUser() model.AuthUser {
