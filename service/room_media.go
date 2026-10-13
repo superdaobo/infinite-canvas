@@ -75,6 +75,12 @@ func UploadRoomMedia(ctx context.Context, roomID, filename, contentType string, 
 // 调用方给定。受信任的服务端路径（学校结果回填 #22）以任务提交人作为归属人调用，
 // 不经过用户 context；归属人必须是该房间的可写成员（由调用方先行校验）。
 func storeRoomMedia(roomID, actorID, filename, contentType string, src io.Reader) (model.RoomMediaView, error) {
+	return storeRoomMediaWithLimit(roomID, actorID, filename, contentType, src, MaxRoomMediaBytes)
+}
+
+// storeRoomMediaWithLimit 把字节流写入临时文件并做摘要与大小校验，再落位登记。
+// 单请求路径使用 MaxRoomMediaBytes；分片上传合并路径使用更大的 MaxRoomMediaChunkedBytes。
+func storeRoomMediaWithLimit(roomID, actorID, filename, contentType string, src io.Reader, maxBytes int64) (model.RoomMediaView, error) {
 	roomID = strings.TrimSpace(roomID)
 	actorID = strings.TrimSpace(actorID)
 	if actorID == "" {
@@ -102,21 +108,27 @@ func storeRoomMedia(roomID, actorID, filename, contentType string, src io.Reader
 	}()
 
 	hasher := sha256.New()
-	size, err := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(src, MaxRoomMediaBytes+1))
+	size, err := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(src, maxBytes+1))
 	if err != nil {
 		return model.RoomMediaView{}, err
 	}
 	if size == 0 {
 		return model.RoomMediaView{}, ErrMediaInvalid
 	}
-	if size > MaxRoomMediaBytes {
+	if size > maxBytes {
 		return model.RoomMediaView{}, ErrMediaTooLarge
 	}
 	if err := tmp.Sync(); err != nil {
 		return model.RoomMediaView{}, err
 	}
 	digest := hex.EncodeToString(hasher.Sum(nil))
+	return finalizeRoomMedia(roomID, actorID, filename, contentType, digest, size, tmp)
+}
 
+// finalizeRoomMedia 把已完整写入的临时文件按内容摘要落位并登记为房间媒体，供单请求
+// 路径与分片合并路径复用。调用方持有 tmp 的所有权：本函数会关闭 tmp；成功时临时文件
+// 已 rename 到内容寻址路径，失败时由调用方负责删除临时文件。
+func finalizeRoomMedia(roomID, actorID, filename, contentType, digest string, size int64, tmp *os.File) (model.RoomMediaView, error) {
 	header := make([]byte, 512)
 	read, _ := tmp.ReadAt(header, 0)
 	kind, mimeType, ok := classifyRoomMedia(contentType, header[:read])
@@ -128,13 +140,14 @@ func storeRoomMedia(roomID, actorID, filename, contentType string, src io.Reader
 		return model.RoomMediaView{}, err
 	}
 
+	dir := roomMediaDir()
 	relPath := filepath.ToSlash(filepath.Join(digest[:2], digest))
 	absPath := filepath.Join(dir, filepath.FromSlash(relPath))
 	if _, statErr := os.Stat(absPath); statErr != nil {
 		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 			return model.RoomMediaView{}, err
 		}
-		if err := os.Rename(tmpPath, absPath); err != nil {
+		if err := os.Rename(tmp.Name(), absPath); err != nil {
 			return model.RoomMediaView{}, err
 		}
 	}
@@ -364,6 +377,18 @@ func classifyRoomMedia(declared string, header []byte) (model.RoomMediaKind, str
 		}
 	}
 	return kind, declared, true
+}
+
+// declaredRoomMediaTypeAllowed 只依据声明类型做前置白名单校验（不嗅探内容），
+// 用于分片上传会话创建时快速拒绝明显非法/主动内容的类型；内容真伪在完成时再由
+// classifyRoomMedia 用实际字节复核。
+func declaredRoomMediaTypeAllowed(declared string) bool {
+	declared = cleanMimeType(declared)
+	if declared == "" || activeContentMimeTypes[declared] {
+		return false
+	}
+	_, ok := safeRoomMediaMimeKinds[declared]
+	return ok
 }
 
 func cleanMimeType(value string) string {

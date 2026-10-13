@@ -21,6 +21,7 @@ func main() {
 	}
 	service.StartPromptSyncScheduler()
 	service.StartCanvasProjectCleanupScheduler()
+	service.StartRoomMediaUploadCleanupScheduler()
 	handler.StartVideoTaskPoller()
 	log.Fatal(router.New().Run(":" + config.Cfg.Port))
 }
