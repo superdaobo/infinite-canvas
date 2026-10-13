@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { AlertTriangle, ChevronLeft, Hand, Loader2, MousePointer2, Plus, RefreshCw, Redo2, Share2, Trash2, Undo2, Users, Wifi, WifiOff, X } from "lucide-react";
+import { AlertTriangle, ChevronLeft, Hand, ListOrdered, Loader2, MousePointer2, Plus, RefreshCw, Redo2, Share2, Trash2, Undo2, Users, Wifi, WifiOff, X } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import type { CollabCursorInfo } from "@/services/api/collab-realtime";
@@ -12,6 +12,7 @@ import { ConnectionPath } from "../../components/canvas-connections";
 import { InfiniteCanvas } from "../../components/infinite-canvas";
 import { isSharedCanvasEnabled } from "../../mode";
 import type { CanvasNodeData, Position, ViewportTransform } from "../../types";
+import { CollabSchoolQueuePanel } from "../collab-school-queue-panel";
 import { CollabSharingPanel } from "../collab-sharing-panel";
 import { useCollabInviteJoin } from "../use-collab-invite-join";
 import { useCollabRoomEditing, type CollabConflict } from "../use-collab-room-editing";
@@ -136,6 +137,8 @@ export default function CollabRoomPage() {
     // 邀请链接加入（#16）：读取 fragment 令牌，未登录先登录，登录后自动 accept。
     const { joining, joinError } = useCollabInviteJoin(params.roomId, sharedEnabled);
     const [sharingOpen, setSharingOpen] = useState(false);
+    // 学校共享队列浮层（#23）：展示全房间共享 FIFO 队列、个人取消与执行器异常提示。
+    const [schoolOpen, setSchoolOpen] = useState(false);
     // 画布工具：默认「选择」，节点可拖动/双击编辑；「移动画布」用于平移视图。
     // 必须默认 select：pan 工具会在 pointerdown 捕获阶段把指针捕获到画布容器，
     // 使节点收不到鼠标事件，导致拖动与双击编辑全部失效。
@@ -396,6 +399,17 @@ export default function CollabRoomPage() {
                         成员与分享
                     </button>
                 ) : null}
+                {room ? (
+                    <button
+                        type="button"
+                        onClick={() => setSchoolOpen((current) => !current)}
+                        className="flex h-9 items-center gap-1 rounded-lg border px-3 text-sm font-medium backdrop-blur transition hover:opacity-80"
+                        style={{ background: theme.toolbar.panel, borderColor: schoolOpen ? "#3b82f6" : theme.toolbar.border, color: theme.node.text }}
+                    >
+                        <ListOrdered className="size-4" />
+                        学校队列
+                    </button>
+                ) : null}
                 <div
                     className="flex h-9 items-center gap-1 rounded-lg border px-3 text-xs backdrop-blur"
                     style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: realtimeStatus === "revoked" ? "#ef4444" : theme.node.text }}
@@ -648,6 +662,7 @@ export default function CollabRoomPage() {
             ) : null}
 
             {room ? <CollabSharingPanel room={room} open={sharingOpen} onClose={() => setSharingOpen(false)} /> : null}
+            {room ? <CollabSchoolQueuePanel roomId={params.roomId} open={schoolOpen} onClose={() => setSchoolOpen(false)} canSubmit={editable} /> : null}
         </main>
     );
 }
