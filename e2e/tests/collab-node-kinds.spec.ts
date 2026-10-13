@@ -316,4 +316,47 @@ test.describe("协作：8 类节点回归（#24 / C02-06）", () => {
         expect(graph.nodes.some((node) => node.title === "越界参考视频")).toBe(false);
         expect(graph.nodes.some((node) => node.title === "含密钥文本")).toBe(false);
     });
+
+    /**
+     * #65：共享房间 config/director 节点渲染与入口。
+     * 回归前二者回落为「空图片节点」，此处验证与单人模式一致的配置面板与导演台入口，
+     * 并真实打开导演台（iframe）且不产生协作错误。
+     */
+    test("共享房间 config/director 节点渲染配置面板与导演台入口（#65）", async ({ browser, request }) => {
+        const owner = await registerAccount(request);
+        const room = await createRoom(request, owner, "E2E config/director 渲染房间");
+        const context = await browser.newContext();
+        await seedSession(context, owner);
+        const page = await context.newPage();
+        const pageErrors: string[] = [];
+        page.on("pageerror", (error) => pageErrors.push(error.message));
+        await gotoRoom(page, room.id);
+        await waitRoomConnected(page);
+
+        const configId = newNodeId();
+        const directorId = newNodeId();
+        expect(
+            (await apiCreateNode(request, owner, room.id, { id: configId, kind: "config", title: "渲染-配置节点", position: { x: -700, y: 0 }, width: 440, height: 240, metadata: { content: JSON.stringify({ size: "16:9", quality: "high", count: 1 }) } })).status,
+        ).toBe(200);
+        expect((await apiCreateNode(request, owner, room.id, { id: directorId, kind: "director", title: "渲染-导演台节点", position: { x: 400, y: 0 }, width: 960, height: 540, metadata: { directorProject: { shots: [] } } })).status).toBe(200);
+        await expect.poll(() => roomNodeIds(page), { timeout: 15_000 }).toEqual(expect.arrayContaining([configId, directorId]));
+
+        // config 节点渲染真实配置面板，而不是空图片节点占位。
+        const configNode = page.locator(`[data-node-id="${configId}"]`);
+        await expect(configNode.getByText("生成配置", { exact: true })).toBeVisible({ timeout: 15_000 });
+        await expect(configNode.getByText("空图片节点")).toHaveCount(0);
+
+        // director 节点渲染导演台入口，点击后真实打开导演台 iframe。
+        const directorNode = page.locator(`[data-node-id="${directorId}"]`);
+        const openDirector = directorNode.getByRole("button", { name: "打开导演台" });
+        await expect(openDirector).toBeVisible({ timeout: 15_000 });
+        await openDirector.click();
+        await expect(page.locator('iframe[title="3D导演台"]')).toBeVisible({ timeout: 15_000 });
+
+        // 打开导演台不产生协作错误、不产生页面异常。
+        await expect(page.getByText(/待确认变更/)).toHaveCount(0);
+        expect(pageErrors, `页面出现异常：${pageErrors.join(" | ")}`).toEqual([]);
+
+        await context.close();
+    });
 });

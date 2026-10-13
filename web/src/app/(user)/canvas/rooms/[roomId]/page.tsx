@@ -3,15 +3,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { AlertTriangle, ChevronLeft, Hand, ListOrdered, Loader2, MousePointer2, Plus, RefreshCw, Redo2, Share2, Trash2, Undo2, Users, Wifi, WifiOff, X } from "lucide-react";
+import { App } from "antd";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import type { CollabCursorInfo } from "@/services/api/collab-realtime";
 import { useThemeStore } from "@/stores/use-theme-store";
+import { CanvasConfigNodePanel } from "../../components/canvas-config-node-panel";
+import { CanvasDirector } from "../../components/canvas-director";
+import { CanvasDirectorNodePanel } from "../../components/canvas-director-node-panel";
 import { CanvasNode } from "../../components/canvas-node";
+import { buildNodeGenerationInputs } from "../../components/canvas-node-generation";
 import { ConnectionPath } from "../../components/canvas-connections";
 import { InfiniteCanvas } from "../../components/infinite-canvas";
 import { isSharedCanvasEnabled } from "../../mode";
-import type { CanvasNodeData, Position, ViewportTransform } from "../../types";
+import { CanvasNodeType, type CanvasDirectorPanorama, type CanvasNodeData, type Position, type ViewportTransform } from "../../types";
+import { isCanvasImageNodeType } from "../../utils/canvas-panorama";
 import { CollabSchoolQueuePanel } from "../collab-school-queue-panel";
 import { CollabSharingPanel } from "../collab-sharing-panel";
 import { useCollabInviteJoin } from "../use-collab-invite-join";
@@ -28,6 +34,7 @@ import { useCollabRoomRealtime, type CollabRealtimeStatus } from "../use-collab-
 
 const noop = () => undefined;
 const TEXT_NODE_SIZE = { width: 360, height: 200 };
+const EMPTY_INPUT_SUMMARY = { textCount: 0, imageCount: 0, videoCount: 0, audioCount: 0 };
 
 // 冲突差异摘要：只展示本地草稿与服务端最新版本之间的公开字段差异，供用户安全选择。
 function describeNodeConflict(local: CanvasNodeData | null, server: CanvasNodeData | null): string[] {
@@ -96,6 +103,7 @@ type Connecting = { nodeId: string; handleType: "source" | "target" };
 export default function CollabRoomPage() {
     const params = useParams<{ roomId: string }>();
     const router = useRouter();
+    const { message } = App.useApp();
     const [mounted, setMounted] = useState(false);
     const sharedEnabled = isSharedCanvasEnabled();
     const {
@@ -113,6 +121,7 @@ export default function CollabRoomPage() {
         resizeNode,
         updateNodeContent,
         updateNodeTitle,
+        updateNodeMetadata,
         deleteNodes,
         connectNodes,
         disconnectEdge,
@@ -149,6 +158,8 @@ export default function CollabRoomPage() {
     const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
     const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
     const [connecting, setConnecting] = useState<Connecting | null>(null);
+    // 导演台（#65）：共享房间中 director 节点打开真实导演台浮层。
+    const [openDirectorNodeId, setOpenDirectorNodeId] = useState<string | null>(null);
 
     const viewportRef = useRef(viewport);
     viewportRef.current = viewport;
@@ -289,6 +300,57 @@ export default function CollabRoomPage() {
         });
         return map;
     }, [nodes]);
+
+    const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+
+    // 导演台全景：指向 director 节点的入边中带内容的图片节点（与单人模式同一推导，纯图结构）。
+    const directorPanoramasByNodeId = useMemo(() => {
+        const map = new Map<string, CanvasDirectorPanorama[]>();
+        nodes.forEach((node) => {
+            if (node.type === CanvasNodeType.Director) map.set(node.id, []);
+        });
+        connections.forEach((connection) => {
+            const target = nodeById.get(connection.toNodeId);
+            const source = nodeById.get(connection.fromNodeId);
+            if (target?.type !== CanvasNodeType.Director || !isCanvasImageNodeType(source?.type) || !source?.metadata?.content) return;
+            map.get(target.id)?.push({
+                edgeId: connection.id,
+                sourceNodeId: source.id,
+                imageUrl: source.metadata.content,
+                fileName: source.title || "画布图片.png",
+                projectionMode: source.metadata.panoramaProjection === "equirectangular" ? "equirectangular" : "backdrop",
+            });
+        });
+        return map;
+    }, [connections, nodeById, nodes]);
+
+    // 配置节点输入摘要：沿用单人模式的生成输入推导（只读图结构，不依赖单人 store）。
+    const configInputSummaryByNodeId = useMemo(() => {
+        const map = new Map<string, typeof EMPTY_INPUT_SUMMARY>();
+        nodes.forEach((node) => {
+            if (node.type !== CanvasNodeType.Config) return;
+            const inputs = buildNodeGenerationInputs(node.id, nodes, connections);
+            map.set(node.id, {
+                textCount: inputs.filter((input) => input.type === "text").length,
+                imageCount: inputs.filter((input) => input.type === "image").length,
+                videoCount: inputs.filter((input) => input.type === "video").length,
+                audioCount: inputs.filter((input) => input.type === "audio").length,
+            });
+        });
+        return map;
+    }, [connections, nodes]);
+
+    const openDirectorNode = openDirectorNodeId ? nodeById.get(openDirectorNodeId) || null : null;
+
+    // 导演台节点被删除/替换时关闭浮层，避免悬浮在已不存在的节点上。
+    useEffect(() => {
+        if (openDirectorNodeId && !nodes.some((node) => node.id === openDirectorNodeId)) setOpenDirectorNodeId(null);
+    }, [nodes, openDirectorNodeId]);
+
+    // 共享房间不支持把导演台截图/视频写回公共图（媒体为本地大对象，无法通过 1MiB metadata 契约广播）。
+    function notifyDirectorOutputUnsupported() {
+        message.info("共享房间暂不支持把导演台截图/视频写回画布，请在单人画布中使用该导演台。");
+    }
 
     // 冲突差异摘要：本地草稿 vs 服务端最新版本，帮助用户安全选择。
     const conflictDiff = useMemo(() => (conflict ? describeNodeConflict(conflict.localNode, conflict.serverNode) : []), [conflict]);
@@ -539,11 +601,45 @@ export default function CollabRoomPage() {
                         onContentChange={updateNodeContent}
                         onTitleChange={updateNodeTitle}
                         onContextMenu={(event) => event.preventDefault()}
+                        renderNodeContent={(contentNode) =>
+                            contentNode.type === CanvasNodeType.Director ? (
+                                <CanvasDirectorNodePanel onOpen={() => setOpenDirectorNodeId(contentNode.id)} />
+                            ) : (
+                                <CanvasConfigNodePanel
+                                    node={contentNode}
+                                    isRunning={false}
+                                    inputSummary={configInputSummaryByNodeId.get(contentNode.id) || EMPTY_INPUT_SUMMARY}
+                                    onConfigChange={(nodeId, patch) => {
+                                        if (editable) updateNodeMetadata(nodeId, patch);
+                                    }}
+                                    onComposerToggle={() => message.info("共享房间暂不支持组装提示词，请在单人画布中打开该配置节点。")}
+                                    onGenerate={() => message.info("共享房间暂不支持直接生成，请在单人画布中打开该配置节点。")}
+                                />
+                            )
+                        }
                     />
                 ))}
 
                 <RemoteCursorLayer cursors={cursors} />
             </InfiniteCanvas>
+
+            {openDirectorNode?.type === CanvasNodeType.Director ? (
+                <CanvasDirector
+                    nodeId={openDirectorNode.id}
+                    project={openDirectorNode.metadata?.directorProject}
+                    panoramas={directorPanoramasByNodeId.get(openDirectorNode.id) || []}
+                    theme={colorTheme}
+                    onClose={() => setOpenDirectorNodeId(null)}
+                    onProjectChange={(project) => {
+                        if (editable) updateNodeMetadata(openDirectorNode.id, { directorProject: project });
+                    }}
+                    onPanoramaRemoved={({ edgeId }) => {
+                        if (editable) disconnectEdge(edgeId);
+                    }}
+                    onCapturesSent={notifyDirectorOutputUnsupported}
+                    onVideoSent={notifyDirectorOutputUnsupported}
+                />
+            ) : null}
 
             {realtimeStatus === "revoked" ? (
                 <div className="pointer-events-none absolute inset-x-0 top-16 z-[95] grid place-items-center">
