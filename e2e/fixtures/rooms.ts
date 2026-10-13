@@ -64,6 +64,17 @@ export function newNodeId() {
     return `node_${randomSuffix()}`;
 }
 
+/** 公共图节点种子：8 类节点共用结构，metadata 为进入公共图的 public 字段。 */
+export type RoomNodeSeed = {
+    id: string;
+    kind: string;
+    title: string;
+    position: { x: number; y: number };
+    width: number;
+    height: number;
+    metadata?: Record<string, unknown>;
+};
+
 /** owner 创建共享房间（POST /api/v1/collab/rooms）。 */
 export async function createRoom(request: APIRequestContext, owner: TestAccount, title = "E2E 协作房间"): Promise<RoomSummary> {
     const response = await request.post(`${BACKEND_URL}/api/v1/collab/rooms`, {
@@ -149,6 +160,11 @@ export async function apiCreateTextNode(request: APIRequestContext, account: Tes
     ]);
     expect(result.status, `API 新建节点失败：HTTP ${result.status} ${JSON.stringify(result.body)}`).toBe(200);
     return id;
+}
+
+/** 以账号身份在房间内新建一个任意种类的公共图节点（create 操作，version=0）。 */
+export async function apiCreateNode(request: APIRequestContext, account: TestAccount, roomId: string, node: RoomNodeSeed): Promise<OperationResult> {
+    return postOperations(request, account, roomId, [{ type: "create", node: { ...node, version: 0 } }]);
 }
 
 /** 直接读取房间详情（用于非成员 404 负例），保留状态码。 */
