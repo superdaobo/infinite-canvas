@@ -64,6 +64,34 @@ export async function stopEditingNode(page: Page): Promise<void> {
     await page.keyboard.press("Escape");
 }
 
+/** 房间内连线数量（ConnectionPath 渲染带 data-connection-id）。 */
+export function roomConnectionCount(page: Page): Promise<number> {
+    return page.locator("[data-connection-id]").count();
+}
+
+/** 通过真实 UI 选中某个节点（点击节点主体，不拖动）。 */
+export async function selectRoomNode(page: Page, nodeId: string): Promise<void> {
+    await page.locator(`[data-node-id="${nodeId}"]`).click();
+}
+
+/**
+ * 通过真实 UI 连接两个节点：先点击起点节点选中（露出连线手柄），
+ * 再点击右侧 source 手柄进入连线态，最后点击终点节点完成连接。
+ * 手柄为节点根元素下的 `div.cursor-crosshair`（左 target / 右 source）。
+ */
+export async function connectRoomNodes(page: Page, fromNodeId: string, toNodeId: string): Promise<void> {
+    await selectRoomNode(page, fromNodeId);
+    const handles = page.locator(`[data-node-id="${fromNodeId}"] div.cursor-crosshair`);
+    await handles.nth(1).click();
+    await page.locator(`[data-node-id="${toNodeId}"]`).click();
+}
+
+/** 选中节点后按 Delete 键删除（页面监听 window keydown）。 */
+export async function deleteRoomNodeByKeyboard(page: Page, nodeId: string): Promise<void> {
+    await selectRoomNode(page, nodeId);
+    await page.keyboard.press("Delete");
+}
+
 /** 以真实指针拖拽移动节点（页面监听 window pointermove/pointerup）。 */
 export async function dragNode(page: Page, nodeId: string, dx: number, dy: number): Promise<void> {
     const box = await page.locator(`[data-node-id="${nodeId}"]`).boundingBox();
