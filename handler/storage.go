@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 
@@ -129,6 +130,10 @@ func DeleteDirectFileRecord(w http.ResponseWriter, r *http.Request, id string) {
 	OK(w, true)
 }
 
+// downloadStorageObject 是公开文件读取路径的数据获取函数，默认走 service 实现；
+// 声明为变量以便测试注入（与 proxyImageHTTPClient 同模式，不改变生产行为）。
+var downloadStorageObject = service.DownloadStorageObject
+
 // FileContent 获取文件内容。
 func FileContent(w http.ResponseWriter, r *http.Request, id string) {
 	// R1 收敛：房间共享媒体不得经公开对象 ID 路径读取，必须走成员鉴权接口。
@@ -136,13 +141,20 @@ func FileContent(w http.ResponseWriter, r *http.Request, id string) {
 		writeFileReadDenied(w, err)
 		return
 	}
-	download, err := service.DownloadStorageObject(id, r.Header.Get("Range"))
+	download, err := downloadStorageObject(id, r.Header.Get("Range"))
 	if err != nil {
 		FailError(w, err)
 		return
 	}
 	defer download.Stream.Close()
-	w.Header().Set("Content-Type", download.Object.MimeType)
+	// 存储对象的 MIME 由上传方声明、不可信：一律禁止嗅探；主动内容（SVG/HTML/XML/JS）
+	// 降级为通用二进制并强制附件下载，避免经公开文件路径形成存储型 XSS。
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	contentType, inline := downloadResponseContentType(download.Object.MimeType)
+	w.Header().Set("Content-Type", contentType)
+	if !inline {
+		w.Header().Set("Content-Disposition", contentDispositionAttachment(objectDownloadFilename(download.Object)))
+	}
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	if download.AcceptRanges {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -183,6 +195,25 @@ func writeFileReadDenied(w http.ResponseWriter, err error) {
 	FailError(w, err)
 }
 
+// downloadResponseContentType 收敛公开文件下载与图片代理的响应类型：空类型与主动内容
+// （SVG/HTML/XML/JS）一律降级为通用二进制并要求附件下载，其余类型原样返回。
+// 返回 (响应 Content-Type, 是否允许同源内联渲染)。绝不回显可用于执行脚本的声明类型。
+func downloadResponseContentType(mimeType string) (string, bool) {
+	contentType := strings.TrimSpace(mimeType)
+	if contentType == "" || service.ActiveContentMimeType(contentType) {
+		return "application/octet-stream", false
+	}
+	return contentType, true
+}
+
+// objectDownloadFilename 取存储对象的下载文件名（对象键基名，缺省回退对象 ID）。
+func objectDownloadFilename(object model.StorageObject) string {
+	if name := path.Base(strings.TrimSpace(object.ObjectKey)); name != "" && name != "." && name != "/" {
+		return name
+	}
+	return object.ID
+}
+
 // AdminMeasureStorageProvider 管理员统计存储容量。
 func AdminMeasureStorageProvider(w http.ResponseWriter, r *http.Request) {
 	var request struct {
@@ -201,6 +232,10 @@ func AdminMeasureStorageProvider(w http.ResponseWriter, r *http.Request) {
 	OK(w, result)
 }
 
+// proxyImageHTTPClient 是图片代理使用的出网客户端，默认走 SSRF 白名单客户端
+// （service.SafeProxyHTTPClient）；声明为变量以便测试替换（与 service.SchoolResultDownloader 同模式）。
+var proxyImageHTTPClient = service.SafeProxyHTTPClient
+
 // ProxyImage 代理图片请求（解决跨域和机器人检测问题）。
 func ProxyImage(w http.ResponseWriter, r *http.Request) {
 	targetURL := r.URL.Query().Get("url")
@@ -212,7 +247,7 @@ func ProxyImage(w http.ResponseWriter, r *http.Request) {
 		Fail(w, "无效的 url")
 		return
 	}
-	client := service.SafeProxyHTTPClient()
+	client := proxyImageHTTPClient()
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
 		FailError(w, err)
@@ -234,26 +269,25 @@ func ProxyImage(w http.ResponseWriter, r *http.Request) {
 		FailWithStatus(w, http.StatusBadGateway, "代理图片请求失败: "+resp.Status)
 		return
 	}
-	contentType := resp.Header.Get("Content-Type")
-	isImage := strings.HasPrefix(contentType, "image/")
-	var data []byte
-	if isImage {
-		data, err = io.ReadAll(resp.Body)
-		if err != nil {
+	contentType, inline := downloadResponseContentType(resp.Header.Get("Content-Type"))
+	w.Header().Set("Content-Type", contentType)
+	// 上游声明的 Content-Type 不可信：一律禁止嗅探；主动内容降级为通用二进制并强制
+	// 附件下载，避免把远端 HTML/SVG 反射为同源 XSS。
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if !inline {
+		w.Header().Set("Content-Disposition", "attachment")
+	}
+	if inline && strings.HasPrefix(contentType, "image/") {
+		data, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
 			FailWithStatus(w, http.StatusBadGateway, "代理图片请求失败")
 			return
 		}
-	}
-	if contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	} else {
-		w.Header().Set("Content-Type", "application/octet-stream")
-	}
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	w.WriteHeader(resp.StatusCode)
-	if isImage {
+		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(data)
 		return
 	}
+	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

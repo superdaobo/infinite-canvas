@@ -394,6 +394,77 @@ func TestWSSnapshotRedactsPrivateMetadata(t *testing.T) {
 	}
 }
 
+// TestWSDisconnectOnAccountBan 账号被封禁后，其已建立的 WS 连接被主动关闭（4401）。
+func TestWSDisconnectOnAccountBan(t *testing.T) {
+	env := setupWSTestEnv(t)
+
+	_, editorTicket := issueWSTicket(t, env, env.editor.Token, env.roomID)
+	editorConn := dialRoomWS(t, env, env.roomID, editorTicket)
+	if end := waitForType(t, editorConn, "snapshot-end"); end == nil {
+		t.Fatal("editor 未收到 snapshot-end")
+	}
+
+	banWSUser(t, env.editor)
+
+	code, readErr := readUntilClosed(t, editorConn)
+	if readErr == nil {
+		t.Fatal("被封禁账号的 WS 连接应被主动关闭")
+	}
+	if code != 4401 {
+		t.Fatalf("封禁断开关闭码应为 4401，实际 %v", code)
+	}
+}
+
+// TestWSConnectRejectedForBannedAccount 封禁前签发的未使用 ticket 也不能再建连（4403）。
+func TestWSConnectRejectedForBannedAccount(t *testing.T) {
+	env := setupWSTestEnv(t)
+
+	_, viewerTicket := issueWSTicket(t, env, env.viewer.Token, env.roomID)
+	if viewerTicket == "" {
+		t.Fatal("viewer 应能换取 ticket")
+	}
+	// 封禁 viewer（此时尚未建立 WS 连接）。
+	banWSUser(t, env.viewer)
+
+	wsURL := "ws" + strings.TrimPrefix(env.server.URL, "http") + "/api/v1/collab/rooms/" + env.roomID + "/ws"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("建立 WS 连接失败: %v", err)
+	}
+	defer conn.CloseNow()
+	if err := wsjson.Write(ctx, conn, map[string]any{
+		"type": "hello", "protocolVersion": "1", "roomId": env.roomID, "ticket": viewerTicket,
+	}); err != nil {
+		t.Fatalf("发送 hello 失败: %v", err)
+	}
+	_, _, err = conn.Read(ctx)
+	if err == nil {
+		_, closeErr := readUntilClosed(t, conn)
+		err = closeErr
+	}
+	if err == nil {
+		t.Fatal("封禁账号使用封禁前签发的 ticket 建连应被拒绝")
+	}
+	if code := websocket.CloseStatus(err); code != 4403 {
+		t.Fatalf("封禁账号建连关闭码应为 4403，实际 %v", code)
+	}
+}
+
+// banWSUser 等价于后台把账号 status 置为 ban，用于验证会话即时失权。
+func banWSUser(t *testing.T, session model.AuthSession) {
+	t.Helper()
+	if _, err := service.SaveUser(model.User{
+		ID:       session.User.ID,
+		Username: session.User.Username,
+		Role:     model.UserRoleUser,
+		Status:   model.UserStatusBan,
+	}, ""); err != nil {
+		t.Fatalf("封禁账号失败: %v", err)
+	}
+}
+
 // TestWSDisconnectOnMemberRemoval 成员被移除后，其已建立的 WS 连接被主动关闭。
 func TestWSDisconnectOnMemberRemoval(t *testing.T) {
 	env := setupWSTestEnv(t)

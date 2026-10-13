@@ -341,6 +341,13 @@ func RoomMediaInlineSafe(mimeType string) bool {
 	return ok
 }
 
+// ActiveContentMimeType 判断类型是否为可在同源内联执行脚本的主动内容
+// （SVG/HTML/XML/JS）。公开文件读取与图片代理等既有路径复用它，把主动内容
+// 降级为通用二进制 + 附件下载，避免存储型/反射型 XSS（见 security-audit.md）。
+func ActiveContentMimeType(mimeType string) bool {
+	return activeContentMimeTypes[cleanMimeType(mimeType)]
+}
+
 // RoomMediaResponseContentType 返回响应应使用的 Content-Type：只接受上传时校验通过的
 // 内联安全白名单类型，其余（历史遗留主动内容或未知类型）一律回退为通用二进制类型。
 // 绝不回显客户端在上传时声明的原始值。
