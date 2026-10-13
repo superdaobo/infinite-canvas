@@ -92,14 +92,24 @@ func TestValidateSchoolChannelParams(t *testing.T) {
 		code    string // 空表示期望通过
 	}{
 		{"千问文生图", SchoolChannelQwen, SchoolTaskParams{Prompt: "海边小镇"}, ""},
+		{"千问文生图带合法尺寸与数量", SchoolChannelQwen, SchoolTaskParams{Prompt: "海边小镇", Size: "16:9", Count: 1}, ""},
 		{"千问带参考图被拒", SchoolChannelQwen, SchoolTaskParams{ReferenceImages: h3Refs(1)}, contract.CodeInvalidPayload},
 		{"千问带秒数被拒", SchoolChannelQwen, SchoolTaskParams{VideoSeconds: 5}, contract.CodeInvalidPayload},
+		{"千问数量大于一被拒", SchoolChannelQwen, SchoolTaskParams{Prompt: "p", Count: 2}, contract.CodeInvalidPayload},
+		{"千问数量为负被拒", SchoolChannelQwen, SchoolTaskParams{Prompt: "p", Count: -1}, contract.CodeInvalidPayload},
+		{"千问尺寸格式非法被拒", SchoolChannelQwen, SchoolTaskParams{Prompt: "p", Size: "wide"}, contract.CodeInvalidPayload},
+		{"千问尺寸零宽被拒", SchoolChannelQwen, SchoolTaskParams{Prompt: "p", Size: "0:1"}, contract.CodeInvalidPayload},
+		{"千问提示词占位被拒", SchoolChannelQwen, SchoolTaskParams{Prompt: "参考 @图片1"}, contract.CodeInvalidPayload},
 		{"H3 一张参考图", SchoolChannelH3, SchoolTaskParams{ReferenceImages: h3Refs(1), VideoSeconds: 4}, ""},
 		{"H3 九张参考图", SchoolChannelH3, SchoolTaskParams{ReferenceImages: h3Refs(9), VideoSeconds: 15}, ""},
 		{"H3 零张参考图被拒", SchoolChannelH3, SchoolTaskParams{ReferenceImages: h3Refs(0), VideoSeconds: 5}, contract.CodeInvalidPayload},
 		{"H3 十张参考图被拒", SchoolChannelH3, SchoolTaskParams{ReferenceImages: h3Refs(10), VideoSeconds: 5}, contract.CodeInvalidPayload},
+		{"H3 重复参考图被拒", SchoolChannelH3, SchoolTaskParams{ReferenceImages: []string{"img-a", "img-a"}, VideoSeconds: 5}, contract.CodeInvalidPayload},
+		{"H3 非法参考图 ID 被拒", SchoolChannelH3, SchoolTaskParams{ReferenceImages: []string{"!!!"}, VideoSeconds: 5}, contract.CodeInvalidPayload},
 		{"H3 秒数过小被拒", SchoolChannelH3, SchoolTaskParams{ReferenceImages: h3Refs(1), VideoSeconds: 3}, contract.CodeInvalidPayload},
 		{"H3 秒数过大被拒", SchoolChannelH3, SchoolTaskParams{ReferenceImages: h3Refs(1), VideoSeconds: 16}, contract.CodeInvalidPayload},
+		{"H3 占位在范围内通过", SchoolChannelH3, SchoolTaskParams{Prompt: "以 @图片1 为首帧", ReferenceImages: h3Refs(2), VideoSeconds: 5}, ""},
+		{"H3 占位越界被拒", SchoolChannelH3, SchoolTaskParams{Prompt: "以 @图片3 为首帧", ReferenceImages: h3Refs(2), VideoSeconds: 5}, contract.CodeInvalidPayload},
 		{"未知渠道被拒", SchoolChannel("doubao"), SchoolTaskParams{}, contract.CodeInvalidPayload},
 	}
 	for _, tc := range cases {
@@ -249,5 +259,56 @@ func TestSchoolTaskPublicView_NoSecrets(t *testing.T) {
 		if !strings.Contains(encoded, want) {
 			t.Fatalf("公开视图应可区分 %s：%s", want, encoded)
 		}
+	}
+}
+
+// TestValidateSchoolImageSize 覆盖学校千问图片尺寸标记的正反例。
+func TestValidateSchoolImageSize(t *testing.T) {
+	valid := []string{"", "1:1", "16:9", "9:16-2k", "21:9-4k"}
+	for _, size := range valid {
+		if err := ValidateSchoolImageSize(size); err != nil {
+			t.Errorf("尺寸 %q 应通过，实际 %v", size, err)
+		}
+	}
+	invalid := []string{"wide", "16-9", "0:1", "1:0", "16:9-8k", "16:9x", ":9", "16:"}
+	for _, size := range invalid {
+		assertModelCode(t, ValidateSchoolImageSize(size), contract.CodeInvalidPayload)
+	}
+}
+
+// TestRenderSchoolPrompt 覆盖提示词 @图片N 占位的正反例（1 基序号）。
+func TestRenderSchoolPrompt(t *testing.T) {
+	cases := []struct {
+		name     string
+		prompt   string
+		refCount int
+		want     string
+		wantErr  bool
+	}{
+		{"无占位原样返回", "海边小镇", 0, "海边小镇", false},
+		{"单占位替换", "以 @图片1 为首帧", 1, "以 <Picture 1> 为首帧", false},
+		{"多占位按序替换", "融合 @图片1 与 @图片2", 2, "融合 <Picture 1> 与 <Picture 2>", false},
+		{"九张内最大序号", "@图片9", 9, "<Picture 9>", false},
+		{"零序号越界", "@图片0", 1, "", true},
+		{"超出参考图数量", "@图片2", 1, "", true},
+		{"文生图出现占位", "@图片1", 0, "", true},
+		{"数字溢出越界", "@图片99999999999999999999", 9, "", true},
+		{"无数字不算占位", "@图片 参考", 0, "@图片 参考", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := RenderSchoolPrompt(tc.prompt, tc.refCount)
+			if tc.wantErr {
+				assertModelCode(t, err, contract.CodeInvalidPayload)
+				return
+			}
+			if err != nil {
+				t.Fatalf("应通过，实际错误：%v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("占位替换结果应为 %q，实际 %q", tc.want, got)
+			}
+		})
 	}
 }

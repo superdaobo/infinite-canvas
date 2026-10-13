@@ -139,7 +139,7 @@ func BindSchoolTaskUpstream(task *model.SchoolTask, upstreamTaskID string) error
 
 // sameSchoolTaskParams 比较两个学校任务参数是否一致（幂等判定依据）。
 func sameSchoolTaskParams(a, b model.SchoolTaskParams) bool {
-	if a.Prompt != b.Prompt || a.VideoSeconds != b.VideoSeconds || a.Size != b.Size || a.Quality != b.Quality {
+	if a.Prompt != b.Prompt || a.VideoSeconds != b.VideoSeconds || a.Size != b.Size || a.Quality != b.Quality || a.Count != b.Count {
 		return false
 	}
 	if len(a.ReferenceImages) != len(b.ReferenceImages) {
