@@ -44,6 +44,7 @@ description: 当前后端主要数据表与字段说明
 - `collab_room_operations`
 - `collab_room_history`
 - `collab_room_media`
+- `collab_room_media_uploads`
 - `school_tasks`
 - `school_devices`
 
@@ -523,6 +524,31 @@ Bridge 持久化请求队列表。普通执行请求由服务端按设备分配�
 索引：`idx_collab_room_media_room_created (room_id, updated_at)`
 
 删除房间时在同一事务内级联删除该房间的媒体索引；blob 采用内容寻址，删除记录后若已无其他房间引用同一内容才回收文件。
+
+
+### collab_room_media_uploads
+
+房间媒体分片上传会话表（协作 v1，C04-03）。用于突破 Cloudflare 100MB 单次请求体上限：单个大文件按服务端指定的固定分片大小（默认 8 MiB，单分片请求上限 16 MiB）切分后逐个上传，完成时服务端按序合并、校验总大小与 SHA-256 摘要，再复用单请求路径的落位逻辑登记为 `collab_room_media`。分片本身不落库，按「会话 ID + 序号」存放在 `MEDIA_DIR/tmp/uploads/<会话 ID>/` 私有临时目录，合并成功或会话过期后回收。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键，`mup-<uuid>` |
+| `room_id` | string | 所属协作房间 |
+| `created_by` | string | 会话创建者用户 ID；只有创建者可上传分片/完成/取消 |
+| `filename` | string | 原始文件名，最长 200 rune |
+| `mime_type` | string | 创建时声明的 MIME 类型（完成时用实际字节复核） |
+| `total_bytes` | number | 声明的文件总字节数 |
+| `chunk_bytes` | number | 服务端指定的固定分片大小，末片可更小 |
+| `chunk_count` | number | 分片总数，由 `total_bytes` 与 `chunk_bytes` 推导 |
+| `digest` | string | 期望的 SHA-256 十六进制摘要，完成时校验；绝不返回给客户端 |
+| `status` | string | 状态机：`pending`、`completing`、`completed`、`aborted` |
+| `media_id` | string | 完成后指向 `collab_room_media.id`；重复完成请求据此幂等返回 |
+| `expires_at` | datetime | 会话过期时间，过期后由清理任务回收临时分片 |
+| `created_at` / `updated_at` | datetime | 时间戳 |
+
+索引：`idx_collab_room_media_uploads_room (room_id)`、`idx_collab_room_media_uploads_expiry (expires_at)`。
+
+完成请求通过状态比较交换（`pending` → `completing`）抢占：并发完成只有一个进入合并，其余返回已完成媒体（幂等）或 409；合并/校验失败回退为 `pending`，允许补齐分片后重试。删除房间时在同一事务内级联删除该房间的上传会话。
 
 
 ### school_tasks

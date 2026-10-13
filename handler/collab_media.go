@@ -119,7 +119,8 @@ func contentDispositionAttachment(filename string) string {
 // writeCollabMediaError 把房间媒体业务错误映射为统一响应结构与 HTTP 状态码。
 func writeCollabMediaError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, service.ErrRoomNotFound), errors.Is(err, service.ErrMediaNotFound):
+	case errors.Is(err, service.ErrRoomNotFound), errors.Is(err, service.ErrMediaNotFound),
+		errors.Is(err, service.ErrMediaUploadNotFound):
 		FailWithStatus(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, service.ErrRoomForbidden):
 		FailWithStatus(w, http.StatusForbidden, err.Error())
@@ -127,7 +128,13 @@ func writeCollabMediaError(w http.ResponseWriter, err error) {
 		FailWithStatus(w, http.StatusUnsupportedMediaType, err.Error())
 	case errors.Is(err, service.ErrMediaTooLarge):
 		FailWithStatus(w, http.StatusRequestEntityTooLarge, err.Error())
-	case errors.Is(err, service.ErrRoomInvalid), errors.Is(err, service.ErrMediaInvalid):
+	case errors.Is(err, service.ErrMediaUploadExpired):
+		FailWithStatus(w, http.StatusGone, err.Error())
+	case errors.Is(err, service.ErrMediaUploadConflict), errors.Is(err, service.ErrMediaUploadState),
+		errors.Is(err, service.ErrMediaUploadIncomplete):
+		FailWithStatus(w, http.StatusConflict, err.Error())
+	case errors.Is(err, service.ErrRoomInvalid), errors.Is(err, service.ErrMediaInvalid),
+		errors.Is(err, service.ErrMediaDigestMismatch):
 		FailWithStatus(w, http.StatusBadRequest, err.Error())
 	default:
 		FailError(w, err)

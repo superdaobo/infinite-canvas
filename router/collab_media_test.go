@@ -2,6 +2,8 @@ package router
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -150,6 +153,32 @@ func doMediaRequest(t *testing.T, env *mediaTestEnv, method, url, token, rangeHe
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return resp, body
+}
+
+// doMediaBody 发起一次带可选令牌、Content-Type 与请求体的请求，返回响应与响应体。
+func doMediaBody(t *testing.T, env *mediaTestEnv, method, url, token, contentType string, body []byte) (*http.Response, []byte) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, env.server.URL+url, reader)
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := env.server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp, raw
 }
 
 func decodeMediaView(t *testing.T, raw json.RawMessage) model.RoomMediaView {
@@ -307,5 +336,140 @@ func TestCollabRoomMediaContract(t *testing.T) {
 	resp, _ = doMediaRequest(t, env, http.MethodGet, mediaURL(env.roomID, image.ID, "content"), env.owner.Token, "")
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("删除后读取应 404，实际 %d", resp.StatusCode)
+	}
+}
+
+// TestCollabRoomMediaChunkedUploadContract 房间媒体分片上传端到端契约（C04-03 #26）：
+// 经真实路由与 JWT 鉴权完成创建会话 → 乱序分片 → 进度 → 完成 → Range 播放，
+// 并覆盖权限、缺分片、幂等与非法类型负例。
+func TestCollabRoomMediaChunkedUploadContract(t *testing.T) {
+	env := setupMediaTestEnv(t)
+	original := service.RoomMediaChunkBytes
+	service.RoomMediaChunkBytes = 8
+	t.Cleanup(func() { service.RoomMediaChunkBytes = original })
+
+	data := pngBytes(64)
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:])
+	uploadsURL := mediaURL(env.roomID, "uploads")
+
+	createBody, _ := json.Marshal(map[string]any{
+		"filename": "chunked.png", "contentType": "image/png", "totalBytes": len(data), "sha256": digest,
+	})
+
+	// --- 反例：viewer 403、非成员 404、匿名 401 不能创建会话 ---
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{"viewer 创建", env.viewer.Token, http.StatusForbidden},
+		{"非成员创建", env.outsider.Token, http.StatusNotFound},
+		{"匿名创建", "", http.StatusUnauthorized},
+	} {
+		resp, _ := doMediaBody(t, env, http.MethodPost, uploadsURL, tc.token, "application/json", createBody)
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s 应 %d，实际 %d", tc.name, tc.want, resp.StatusCode)
+		}
+	}
+
+	// --- 正例：owner 创建会话 ---
+	resp, raw := doMediaBody(t, env, http.MethodPost, uploadsURL, env.owner.Token, "application/json", createBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("owner 创建会话应 200，实际 %d body=%s", resp.StatusCode, string(raw))
+	}
+	var created struct {
+		Code int                       `json:"code"`
+		Data model.RoomMediaUploadView `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("解析会话失败: %v body=%s", err, string(raw))
+	}
+	session := created.Data
+	if session.ChunkCount < 2 || session.ChunkBytes != 8 {
+		t.Fatalf("会话分片参数不正确: %+v", session)
+	}
+
+	// --- 正例：逆序上传分片 ---
+	for i := session.ChunkCount - 1; i >= 0; i-- {
+		start := int64(i) * session.ChunkBytes
+		end := start + session.ChunkBytes
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		chunkURL := uploadsURL + "/" + session.ID + "/chunks/" + strconv.Itoa(i)
+		resp, raw = doMediaBody(t, env, http.MethodPut, chunkURL, env.owner.Token, "application/octet-stream", data[start:end])
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("上传分片 %d 应 200，实际 %d body=%s", i, resp.StatusCode, string(raw))
+		}
+	}
+
+	// --- 正例：进度查询 ---
+	resp, raw = doMediaBody(t, env, http.MethodGet, uploadsURL+"/"+session.ID, env.viewer.Token, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("成员查询进度应 200，实际 %d", resp.StatusCode)
+	}
+	var progress struct {
+		Data model.RoomMediaUploadView `json:"data"`
+	}
+	_ = json.Unmarshal(raw, &progress)
+	if progress.Data.ReceivedChunks != session.ChunkCount {
+		t.Fatalf("进度应为满: %+v", progress.Data)
+	}
+
+	// --- 正例：完成并校验摘要 ---
+	resp, raw = doMediaBody(t, env, http.MethodPost, uploadsURL+"/"+session.ID+"/complete", env.owner.Token, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("完成应 200，实际 %d body=%s", resp.StatusCode, string(raw))
+	}
+	var completed struct {
+		Data model.RoomMediaView `json:"data"`
+	}
+	_ = json.Unmarshal(raw, &completed)
+	media := completed.Data
+	if media.ID != digest || media.Bytes != int64(len(data)) {
+		t.Fatalf("完成媒体不正确: %+v", media)
+	}
+
+	// --- 正例：Range 播放 206 + Content-Range + nosniff ---
+	resp, body := doMediaRequest(t, env, http.MethodGet, mediaURL(env.roomID, media.ID, "content"), env.viewer.Token, "bytes=0-3")
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("Range 播放应 206，实际 %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Range"); got != fmt.Sprintf("bytes 0-3/%d", len(data)) {
+		t.Fatalf("Content-Range 不正确: %q", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if !bytes.Equal(body, data[:4]) {
+		t.Fatalf("Range 内容不正确: %v", body)
+	}
+
+	// --- 正例：重复完成幂等 ---
+	resp, raw = doMediaBody(t, env, http.MethodPost, uploadsURL+"/"+session.ID+"/complete", env.owner.Token, "", nil)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), digest) {
+		t.Fatalf("重复完成应幂等返回同一媒体，实际 %d body=%s", resp.StatusCode, string(raw))
+	}
+
+	// --- 反例：缺分片完成 409 ---
+	resp, raw = doMediaBody(t, env, http.MethodPost, uploadsURL, env.owner.Token, "application/json", createBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("创建第二个会话应 200，实际 %d", resp.StatusCode)
+	}
+	second := struct {
+		Data model.RoomMediaUploadView `json:"data"`
+	}{}
+	_ = json.Unmarshal(raw, &second)
+	resp, _ = doMediaBody(t, env, http.MethodPost, uploadsURL+"/"+second.Data.ID+"/complete", env.owner.Token, "", nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("缺分片完成应 409，实际 %d", resp.StatusCode)
+	}
+
+	// --- 反例：非法类型创建会话 415 ---
+	badBody, _ := json.Marshal(map[string]any{"filename": "evil.svg", "contentType": "image/svg+xml", "totalBytes": 64})
+	resp, _ = doMediaBody(t, env, http.MethodPost, uploadsURL, env.owner.Token, "application/json", badBody)
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("非法类型创建会话应 415，实际 %d", resp.StatusCode)
 	}
 }

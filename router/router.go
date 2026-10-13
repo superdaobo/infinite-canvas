@@ -171,6 +171,22 @@ func New() *gin.Engine {
 	v1.DELETE("/collab/rooms/:id/media/:mediaId", func(c *gin.Context) {
 		handler.CollabDeleteRoomMedia(c.Writer, c.Request, c.Param("id"), c.Param("mediaId"))
 	})
+	// 房间媒体分片上传（C04-03 #26）：突破 Cloudflare 100MB 请求体上限，支持续传、进度与幂等。
+	v1.POST("/collab/rooms/:id/media/uploads", func(c *gin.Context) {
+		handler.CollabCreateRoomMediaUpload(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.PUT("/collab/rooms/:id/media/uploads/:sessionId/chunks/:index", func(c *gin.Context) {
+		handler.CollabUploadRoomMediaChunk(c.Writer, c.Request, c.Param("id"), c.Param("sessionId"), c.Param("index"))
+	})
+	v1.POST("/collab/rooms/:id/media/uploads/:sessionId/complete", func(c *gin.Context) {
+		handler.CollabCompleteRoomMediaUpload(c.Writer, c.Request, c.Param("id"), c.Param("sessionId"))
+	})
+	v1.GET("/collab/rooms/:id/media/uploads/:sessionId", func(c *gin.Context) {
+		handler.CollabRoomMediaUploadProgress(c.Writer, c.Request, c.Param("id"), c.Param("sessionId"))
+	})
+	v1.DELETE("/collab/rooms/:id/media/uploads/:sessionId", func(c *gin.Context) {
+		handler.CollabAbortRoomMediaUpload(c.Writer, c.Request, c.Param("id"), c.Param("sessionId"))
+	})
 	// 学校共享生成任务队列（C03-02）：提交/列表/取消，均按房间成员鉴权。
 	v1.POST("/collab/rooms/:id/school-tasks", func(c *gin.Context) {
 		handler.CollabSubmitSchoolTask(c.Writer, c.Request, c.Param("id"))
