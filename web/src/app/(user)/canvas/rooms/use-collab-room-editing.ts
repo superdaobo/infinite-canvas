@@ -768,6 +768,14 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         markNodeDirty(id);
     }
 
+    // 合并写入节点 metadata（仅 public 键；private/local 与凭据键由 buildUpdateOperation 剥离）。
+    // 供共享房间的 config 配置面板与 director 导演台持久化公共配置。
+    function updateNodeMetadata(id: string, patch: Partial<CanvasNodeData["metadata"]>) {
+        if (!nodesRef.current.some((item) => item.id === id)) return;
+        commitNodes(nodesRef.current.map((item) => (item.id === id ? { ...item, metadata: { ...item.metadata, ...patch } } : item)));
+        markNodeDirty(id);
+    }
+
     function deleteNodes(ids: string[]) {
         const remove = new Set(ids);
         if (!remove.size) return;
@@ -842,6 +850,7 @@ export function useCollabRoomEditing(roomId: string, enabled: boolean) {
         resizeNode,
         updateNodeContent,
         updateNodeTitle,
+        updateNodeMetadata,
         deleteNodes,
         connectNodes,
         disconnectEdge,
