@@ -75,10 +75,12 @@
 
 | 渠道 | 常量 | 能力 | 参数约束 |
 |---|---|---|---|
-| 学校千问 | `model.SchoolChannelQwen = "qwen"` | **仅文生图** | `referenceImages` 必须为空；`videoSeconds` 必须为 0 |
+| 学校千问 | `model.SchoolChannelQwen = "qwen"` | **仅文生图** | `referenceImages` 必须为空；`videoSeconds` 必须为 0；`count` 只能为 0/1（缺省 1，见 #21）；`size` 若给出须为 `W:H`（可带 `-2k`/`-4k`，见 #21） |
 | 学校 H3 | `model.SchoolChannelH3 = "h3"` | 有序参考图生视频 | `referenceImages` 数量 **1–9**（复用契约 `contract.ValidateH3ReferenceCount`）；`videoSeconds` 必须是 **4–15** 的整数 |
 
 - H3 参考图为**有序数组**，顺序即语义：第 `i` 张 → 工作流字段 `ref_image_i`（`i=0..8`），对应契约 §6 与 `contract.H3ReferenceField/H3ReferenceMapping`。提交端不得重排。
+- 提示词图片占位按 PoC 语义替换（#21）：`@图片N`（1 基）→ `<Picture N>`；N 必须落在 `1..参考图数量`，越界或为 0 一律 `invalid_payload`。学校千问无参考图，出现占位即拒绝。
+- 参数构建入口（#21）：`service.BuildSchoolUpstreamInput(channel, params)` 输出固定工作流标识、能力与有序 `ref_image_0..8` 字段；`service.BuildSchoolReferenceInputs` 构建、`service.SchoolReferenceNodeIDs` 读回顺序，均为纯函数，供设备执行器与结果回填复用。
 - 校验入口：`model.ValidateSchoolChannelParams(channel, params)`，返回 `*contract.Error`；越界一律 `invalid_payload`（400）。
 - **只约束学校渠道**：上述校验不得施加于其他模型渠道；其他渠道沿用各自既有映射（`service/workflow_mapping.go`）。
 
@@ -155,7 +157,7 @@ type SchoolUpstreamClient interface {
 - **O1（已闭环）**：学校设备归属固定为受控系统级 `(system, school)`，由 C03-03 / #19 落地（`model.SchoolDeviceOwnerScopeSystem`）。
 - **O2（已闭环，mock）**：设备令牌的签发/轮换/吊销由 C03-03 / #19 以「配置化注册密钥 + `school_devices` 记录」实现，明文仅注册/轮换时返回一次；真实凭据与生产签发流程仍待单独授权。
 - **O3**：`school_` 表结构与索引（唯一键 `(roomId, submittedBy, clientTaskId)`）待 #18 落地；本契约不新增表。
-- **O4**：H3 工作流字段的别名/单字段兼容细节（`ref_image` 别名场景）待 #21 对齐。
+- **O4（已闭环，mock）**：H3 工作流字段别名/单字段兼容由 #21 对齐：第 0 张参考图字段为 `ref_image_0`，并保留无编号别名 `ref_image`（`contract.H3ReferenceAlias`）；`ref_image_1..8` 无别名。
 - **O5（新增）**：设备管理入口当前只提供受控 service 调用，尚无管理员 HTTP 路由；上线前需补管理员鉴权的设备管理接口。
 - **R1**：真实学校工作流与凭据不在本仓库、不在本任务范围内；任何真实设备/凭据操作需单独授权。
 - **R2**：mock 上游接口为定义层，尚无生产实现；#18/#22 需用假数据实现并补集成测试。

@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,31 +119,41 @@ func CanTransitionSchoolTask(from, to SchoolTaskStatus) bool {
 
 // SchoolTaskParams 是学校渠道的生成参数。ReferenceImages 为有序数组，
 // 顺序即语义（第 i 张 -> 工作流字段 ref_image_i）；仅 H3 使用且必须 1–9 张。
+// Count 是图片渠道的单次生成数量，学校千问固定为 1（0 视为未指定，等价于 1）。
 type SchoolTaskParams struct {
 	Prompt          string   `json:"prompt"`
 	ReferenceImages []string `json:"referenceImages,omitempty"`
 	VideoSeconds    int      `json:"videoSeconds,omitempty"`
 	Size            string   `json:"size,omitempty"`
 	Quality         string   `json:"quality,omitempty"`
+	Count           int      `json:"count,omitempty"`
 }
 
 // ValidateSchoolChannelParams 校验学校渠道参数。只约束学校渠道，不影响
-// DeepSeek 等其他模型渠道；H3 参考图数量复用契约的 H3 校验。
+// DeepSeek 等其他模型渠道；H3 参考图复用契约的有序参考图校验（数量、ID、去重），
+// 并在最后统一校验提示词图片占位范围。
 func ValidateSchoolChannelParams(channel SchoolChannel, params SchoolTaskParams) error {
 	if !channel.Valid() {
 		return &contract.Error{Code: contract.CodeInvalidPayload, Message: fmt.Sprintf("未知学校渠道 %q", channel)}
 	}
 	switch channel {
 	case SchoolChannelQwen:
-		// 学校千问仅支持文生图，不接受参考图与视频秒数。
+		// 学校千问仅支持文生图，不接受参考图与视频秒数，每次只生成 1 张图片。
 		if len(params.ReferenceImages) > 0 {
 			return &contract.Error{Code: contract.CodeInvalidPayload, Message: "学校千问渠道仅支持文生图，不接受参考图"}
 		}
 		if params.VideoSeconds != 0 {
 			return &contract.Error{Code: contract.CodeInvalidPayload, Message: "学校千问渠道不支持视频秒数"}
 		}
+		if params.Count < 0 || params.Count > 1 {
+			return &contract.Error{Code: contract.CodeInvalidPayload, Message: fmt.Sprintf(
+				"学校千问渠道每次只生成 1 张图片，当前数量 %d", params.Count)}
+		}
+		if err := ValidateSchoolImageSize(params.Size); err != nil {
+			return err
+		}
 	case SchoolChannelH3:
-		if err := contract.ValidateH3ReferenceCount(len(params.ReferenceImages)); err != nil {
+		if err := contract.ValidateOrderedReferences(params.ReferenceImages); err != nil {
 			return err
 		}
 		if params.VideoSeconds < SchoolH3MinVideoSeconds || params.VideoSeconds > SchoolH3MaxVideoSeconds {
@@ -150,7 +162,60 @@ func ValidateSchoolChannelParams(channel SchoolChannel, params SchoolTaskParams)
 				SchoolH3MinVideoSeconds, SchoolH3MaxVideoSeconds, params.VideoSeconds)}
 		}
 	}
+	// 提示词图片占位必须落在实际参考图范围内；文生图无参考图，出现占位即拒绝。
+	if _, err := RenderSchoolPrompt(params.Prompt, len(params.ReferenceImages)); err != nil {
+		return err
+	}
 	return nil
+}
+
+// --- 学校图片渠道参数（千问） ---
+
+// schoolImageSizePattern 校验学校图片渠道尺寸标记：正数宽高比，可选 -2k/-4k 档位。
+var schoolImageSizePattern = regexp.MustCompile(`^[1-9][0-9]*:[1-9][0-9]*(?:-(?:2k|4k))?$`)
+
+// ValidateSchoolImageSize 校验学校千问图片尺寸标记；空值表示未指定，视为合法。
+func ValidateSchoolImageSize(size string) error {
+	size = strings.TrimSpace(size)
+	if size == "" {
+		return nil
+	}
+	if !schoolImageSizePattern.MatchString(size) {
+		return &contract.Error{Code: contract.CodeInvalidPayload, Message: fmt.Sprintf(
+			"学校千问图片尺寸格式非法：%q（应为 W:H，可带 -2k/-4k）", size)}
+	}
+	return nil
+}
+
+// --- 提示词图片占位 ---
+
+// schoolImagePlaceholderPattern 匹配提示词中的 1 基图片占位 @图片N。
+var schoolImagePlaceholderPattern = regexp.MustCompile(`@图片([0-9]+)`)
+
+// RenderSchoolPrompt 把提示词中的 @图片N 占位替换为学校渠道要求的 <Picture N> 形式。
+// N 是 1 基序号，必须落在 1..referenceCount；越界或 0 返回 invalid_payload。
+// 没有占位时原样返回，不改动其他文本。纯函数，供参数构建与校验复用。
+func RenderSchoolPrompt(prompt string, referenceCount int) (string, error) {
+	if !strings.Contains(prompt, "@图片") {
+		return prompt, nil
+	}
+	var renderErr error
+	rendered := schoolImagePlaceholderPattern.ReplaceAllStringFunc(prompt, func(match string) string {
+		digits := strings.TrimPrefix(match, "@图片")
+		index, err := strconv.Atoi(digits)
+		if err != nil || index < 1 || index > referenceCount {
+			if renderErr == nil {
+				renderErr = &contract.Error{Code: contract.CodeInvalidPayload, Message: fmt.Sprintf(
+					"提示词图片占位 %s 越界：参考图数量为 %d，合法序号为 1..%d", match, referenceCount, referenceCount)}
+			}
+			return match
+		}
+		return fmt.Sprintf("<Picture %d>", index)
+	})
+	if renderErr != nil {
+		return "", renderErr
+	}
+	return rendered, nil
 }
 
 // --- 幂等键派生 ---
